@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,6 +127,13 @@ func (c *HostClient) DialRaw(deadline time.Duration) (net.Conn, error) {
 // returned connection still carries the original deadline; cancellation is
 // observed only until the CONNECT/OK handshake has completed.
 func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration) (net.Conn, error) {
+	started := time.Now()
+	var connected, written, acked time.Time
+	defer func() {
+		if os.Getenv("CH_FORK_TIMING") != "" && c.Logf != nil && !acked.IsZero() {
+			c.Logf("vsock handshake stages start_ns=%d unix_connect_ns=%d connect_write_ns=%d ok_wait_ns=%d", started.UnixNano(), connected.Sub(started).Nanoseconds(), written.Sub(connected).Nanoseconds(), acked.Sub(written).Nanoseconds())
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -137,6 +145,7 @@ func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration)
 	dialCtx, cancelDial := context.WithTimeout(ctx, remaining)
 	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", c.BasePath)
 	cancelDial()
+	connected = time.Now()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("launchclient: dial %s: %w", c.BasePath, ctxErr)
@@ -163,9 +172,11 @@ func (c *HostClient) DialRawContext(ctx context.Context, deadline time.Duration)
 	if _, err := conn.Write(proto.HostConnectLine); err != nil {
 		return fail(fmt.Errorf("launchclient: write CONNECT: %w", err))
 	}
+	written = time.Now()
 	if err := drainLine(conn); err != nil {
 		return fail(fmt.Errorf("launchclient: drain OK line: %w", err))
 	}
+	acked = time.Now()
 	if !stopCancel() {
 		_ = conn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {

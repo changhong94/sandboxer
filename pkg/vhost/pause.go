@@ -29,3 +29,14 @@ func (g *pauseGate) lock(ctx context.Context) error {
 
 func (g *pauseGate) Lock()   { _ = g.lock(context.Background()) }
 func (g *pauseGate) Unlock() { g.available <- struct{}{} }
+
+// tryLock is for optional handshake metadata only. Data I/O must use lock.
+func (g *pauseGate) tryLock() bool {
+	g.init()
+	select {
+	case <-g.available:
+		return true
+	default:
+		return false
+	}
+}

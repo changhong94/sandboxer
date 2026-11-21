@@ -155,13 +155,16 @@ type Forwarder struct {
 
 	listeners []net.Listener
 
-	mu        sync.Mutex
-	relays    map[*fwd.Relay]struct{}
-	pending   map[net.Conn]struct{}           // dial/accept reverse conns awaiting connect_ack
-	execs     map[net.Conn]context.CancelFunc // admitted ctl exec conns and capture-cancel signals
-	inflight  sync.WaitGroup                  // forward/exec goroutines admitted before the quiesce gate
-	quiescing bool
-	closed    bool
+	mu                   sync.Mutex
+	relays               map[*fwd.Relay]struct{}
+	pending              map[net.Conn]struct{}           // dial/accept reverse conns awaiting connect_ack
+	execs                map[net.Conn]context.CancelFunc // admitted ctl exec conns and capture-cancel signals
+	inflight             sync.WaitGroup                  // forward/exec goroutines admitted before the quiesce gate
+	quiescing            bool
+	closed               bool
+	spare                net.Conn // raw transport only; no guest request has been written
+	preconnectCancel     context.CancelFunc
+	preconnectGeneration uint64
 }
 
 // NewForwarder builds a forwarder dialing the guest via vsockBase
@@ -380,15 +383,32 @@ func (f *Forwarder) openAccept(client *guestlink.HostClient, spec *proto.Connect
 // standalone helper, while Forwarder must register the raw connection before
 // writing connect{} so a snapshot can close and join an in-flight handshake.
 func (f *Forwarder) openForward(client *guestlink.HostClient, spec *proto.ConnectSpec) (net.Conn, error) {
-	conn, err := client.DialRaw(proto.DeadlineConnect)
+	started := time.Now()
+	conn := f.takePreconnected()
+	reused := conn != nil
+	var dialDone time.Time
+	defer func() {
+		if os.Getenv("CH_FORK_TIMING") != "" && !dialDone.IsZero() {
+			f.logf("forward stages start_ns=%d raw_ns=%d request_ack_ns=%d preconnected=%t", started.UnixNano(), dialDone.Sub(started).Nanoseconds(), time.Since(dialDone).Nanoseconds(), reused)
+		}
+	}()
+	var err error
+	if conn == nil {
+		conn, err = client.DialRaw(proto.DeadlineConnect)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if !f.trackPending(conn) {
+		f.untrackPending(conn)
 		_ = conn.Close()
 		return nil, fmt.Errorf("connect: forwarder gated (quiescing/closed)")
 	}
 	defer f.untrackPending(conn)
+	dialDone = time.Now()
+	// Refill one raw transport while the current request performs its guest
+	// handshake. It is still registered, bounded and drained by Pause/Close.
+	f.Preconnect(context.Background())
 	return finishOpenForward(conn, spec)
 }
 
@@ -418,6 +438,7 @@ func (f *Forwarder) untrackPending(c net.Conn) {
 func (f *Forwarder) Pause() {
 	f.mu.Lock()
 	f.quiescing = true
+	f.clearPreconnectedLocked()
 	f.mu.Unlock()
 }
 
@@ -461,6 +482,7 @@ func (f *Forwarder) Close() {
 		return
 	}
 	f.closed = true
+	f.clearPreconnectedLocked()
 	f.mu.Unlock()
 	f.closeListeners()
 	f.closeActive()
@@ -528,4 +550,85 @@ func modeLabel(spec ForwardSpec) string {
 		return "accept"
 	}
 	return "dial"
+}
+
+// Preconnect overlaps only the raw hybrid-vsock handshake with restore. It
+// sends no guest protocol request or application bytes. The normal caller
+// still waits for identity/entropy/MUX barriers before sending envd init.
+// One bounded, single-use transport is retained, including in pending so all
+// snapshot and shutdown paths account for it. A miss uses the normal dial.
+func (f *Forwarder) Preconnect(ctx context.Context) {
+	client := &guestlink.HostClient{BasePath: f.vsockBase, Logf: f.logf}
+	f.preconnect(ctx, func(ctx context.Context) (net.Conn, error) { return client.DialRawContext(ctx, time.Second) })
+}
+func (f *Forwarder) preconnect(ctx context.Context, dial func(context.Context) (net.Conn, error)) {
+	f.mu.Lock()
+	if f.closed || f.quiescing || f.preconnectCancel != nil || f.spare != nil {
+		f.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	f.preconnectCancel = cancel
+	f.preconnectGeneration++
+	generation := f.preconnectGeneration
+	f.inflight.Add(1)
+	f.mu.Unlock()
+	go func() {
+		defer f.inflight.Done()
+		defer cancel()
+		c, err := dial(ctx)
+		f.mu.Lock()
+		if generation != f.preconnectGeneration {
+			f.mu.Unlock()
+			if c != nil {
+				_ = c.Close()
+			}
+			return
+		}
+		f.preconnectCancel = nil
+		if err != nil || ctx.Err() != nil || f.closed || f.quiescing {
+			f.mu.Unlock()
+			if c != nil {
+				c.Close()
+			}
+			return
+		}
+		f.spare = c
+		f.pending[c] = struct{}{}
+		f.mu.Unlock()
+		time.AfterFunc(time.Second, func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.spare == c {
+				f.spare = nil
+				delete(f.pending, c)
+				c.Close()
+			}
+		})
+	}()
+}
+func (f *Forwarder) takePreconnected() net.Conn {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed || f.quiescing {
+		return nil
+	}
+	c := f.spare
+	f.spare = nil
+	if c != nil {
+		_ = c.SetDeadline(time.Now().Add(proto.DeadlineConnect))
+	}
+	return c
+}
+func (f *Forwarder) clearPreconnectedLocked() {
+	f.preconnectGeneration++
+	if f.preconnectCancel != nil {
+		f.preconnectCancel()
+		f.preconnectCancel = nil
+	}
+	if f.spare != nil {
+		delete(f.pending, f.spare)
+		f.spare.Close()
+		f.spare = nil
+	}
 }

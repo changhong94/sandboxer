@@ -39,6 +39,7 @@ import (
 )
 
 type RuntimeDiskSpec struct {
+	LateBindBase bool // root overlay image selected only at Launch; no image-specific VM pool
 	// Preserve a bound dynamic slot's negotiated VMM features at its saved nonzero geometry.
 	capacityChange   bool
 	Slot             bool
@@ -50,6 +51,11 @@ type RuntimeDiskSpec struct {
 
 // RuntimeSpec fixes the base VM shape. It contains no workload or credentials.
 type RuntimeSpec struct {
+	// RestoreOnly prepares an empty KVM/vCPU holder, never an image-specific VM.
+	RestoreOnly bool
+	// PrivateRAMFork is experimental and requires the native-disk fork VMM.
+	// Memory capture is rejected until the private mapping capture adapter exists.
+	PrivateRAMFork                  bool
 	EnableCheckpoint                bool
 	CurrentRun                      *artifact.CurrentRun
 	preparedHost                    *preparedHostIdentity
@@ -154,6 +160,9 @@ type runtimeOwnedDisk struct {
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
 // Close requests graceful shutdown and waits for the same retained result.
 type Runtime struct {
+	launchAdmission sync.Mutex // serializes RunPrepared adoption with direct Launch
+	readinessRelay  *preparedReadiness
+
 	diskSnapshot  *SnapshotHandler
 	diskLaunch    LaunchSpec
 	diskInventory []diskEntry
@@ -261,6 +270,9 @@ func runtimeDeviceSpecs(disks []RuntimeDiskSpec) ([]vhost.BlockDeviceSpec, error
 			}
 			names[d.Name] = true
 		}
+		if d.LateBindBase && (i != 0 || !d.Overlay || d.BaseCapacity != 0 || d.Slot) {
+			return nil, errors.New("late-bound base requires zero-capacity overlay root")
+		}
 		if d.Slot && (i == 0 || d.Overlay || d.BaseCapacity != 0) {
 			return nil, errors.New("runtime slot must be a single writable data disk")
 		}
@@ -271,10 +283,10 @@ func runtimeDeviceSpecs(disks []RuntimeDiskSpec) ([]vhost.BlockDeviceSpec, error
 			return nil, fmt.Errorf("runtime disk %d: %w", i, err)
 		}
 		if d.Overlay {
-			if d.BaseCapacity <= 0 {
+			if d.BaseCapacity <= 0 && !d.LateBindBase {
 				return nil, fmt.Errorf("runtime disk %d: overlay base capacity required", i)
 			}
-			out = append(out, vhost.BlockDeviceSpec{Capacity: d.BaseCapacity, ReadOnly: true})
+			out = append(out, vhost.BlockDeviceSpec{Capacity: d.BaseCapacity, ReadOnly: true, LateBindReadOnly: d.LateBindBase})
 		} else if d.BaseCapacity != 0 {
 			return nil, fmt.Errorf("runtime disk %d: single disk cannot expose separate base capacity", i)
 		}
@@ -292,6 +304,13 @@ func validateRuntimeSpec(s RuntimeSpec) error {
 	return s.config().ValidateRuntime()
 }
 func StartRuntime(ctx context.Context, spec RuntimeSpec) (_ *Runtime, retErr error) {
+	if spec.PrivateRAMFork {
+		if !spec.EnableCheckpoint {
+			return nil, errors.New("private RAM requires checkpoint disks")
+		}
+
+	}
+
 	if spec.CurrentRun != nil {
 		if err := spec.CurrentRun.Validate(); err != nil {
 			return nil, err
@@ -389,6 +408,8 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 		logf = func(f string, a ...any) { log.Printf("[sandbox-sdk] "+f, a...) }
 	}
 	r := &Runtime{state: runtimeStarting, spec: spec, hostProjection: host, sandboxID: sid, pathID: pathID, runDir: runDir, baseDir: DefaultBaseDir(baseRoot, pathID), startUnixNs: time.Now().UnixNano(), lifeCtx: engineCtx, cancelLife: cancel, signals: signals, stopSignals: stopSignals, identity: identity, exitDone: make(chan struct{}), logf: logf}
+	r.readinessRelay = &preparedReadiness{notify: spec.NotifyReadiness}
+	spec.NotifyReadiness = r.readinessRelay.deliver
 	stopOperation := context.AfterFunc(ctx, func() { signals <- syscall.SIGTERM })
 	defer stopOperation()
 	r.spec.CHBinary = chBinary
@@ -428,6 +449,7 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 		return nil, errors.New("runtime memory exceeds host address space")
 	}
 	initial := resctl.AlignedBudget(capBytes, startup)
+
 	if err := resctl.ValidateBalloonSize(capBytes, resctl.TargetForBudget(capBytes, initial)); err != nil {
 		return nil, err
 	}
@@ -482,9 +504,21 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 		r.tapFile, r.netnsFile, metaMAC, r.metaIP = f, nsf, meta.MAC, meta.IP
 		r.logf("tapfd: received tap fd (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, nsf != nil)
 	}
+	if spec.PrivateRAMFork && r.tapFile != nil {
+		name, err := tapfd.PersistentName(r.tapFile)
+		if err != nil {
+			return nil, err
+		}
+		if err := r.tapFile.Close(); err != nil {
+			return nil, err
+		}
+		r.tapFile = nil
+		cfg.Network.TAP = name
+		cfg.Network.TapFD = nil
+	}
 	netMAC, _ := cfg.Network.Effective(metaMAC, "")
 	baseReady := make(chan struct{})
-	params := VMParams{Ctx: engineCtx, SandboxID: sid, BaseDir: r.baseDir, RunDir: runDir,
+	params := VMParams{PrivateRAMFork: spec.PrivateRAMFork, Ctx: engineCtx, SandboxID: sid, BaseDir: r.baseDir, RunDir: runDir,
 		Balloon: r.balloon, Hooks: hooks, Memory: mc, Cgroup: cg, CapBytes: int64(capBytes), UffdSource: uffd.ZeroSource{},
 		StdioMode: stdio.Mode{Console: spec.Console}, TapFile: r.tapFile, NetnsFile: r.netnsFile, NetMAC: netMAC,
 		Logf: r.logf, StartUnixNs: r.startUnixNs, StatsJSONPath: spec.StatsJSONPath, StatsInterval: spec.StatsInterval,
@@ -503,6 +537,13 @@ func startRuntime(ctx context.Context, spec RuntimeSpec, prepared *preparedHostI
 			if err != nil {
 				cleanup()
 				return nil, nil, err
+			}
+			if spec.PrivateRAMFork {
+				args, err = privateRAMCommand(args, capBytes, runtimePath, runDir, e.Disks)
+				if err != nil {
+					cleanup()
+					return nil, nil, err
+				}
 			}
 			r.logf("CH args: %s", strings.Join(args, " "))
 			if spec.Console.Kind == stdio.ConsoleStderr {
@@ -573,6 +614,18 @@ func cloneSDKConfig(c *config.SandboxConfig) (*config.SandboxConfig, error) {
 	return &out, nil
 }
 func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
+	r.launchAdmission.Lock()
+	defer r.launchAdmission.Unlock()
+	return r.launchPrepared(ctx, spec)
+}
+
+func (r *Runtime) launchPrepared(ctx context.Context, spec LaunchSpec) error {
+	phaseStart := time.Now()
+	phase := func(name string) {
+		now := time.Now()
+		log.Printf("[sandbox-sdk] launch stage=%s duration=%s", name, now.Sub(phaseStart))
+		phaseStart = now
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -697,6 +750,12 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		return fail(fmt.Errorf("launch disk count mismatch"))
 	}
 	for i, shape := range r.spec.Disks {
+		if shape.LateBindBase {
+			slot, _ := r.launch.DiskCapabilities()
+			if !slot {
+				return fail(errors.New("late-bound image requires disk_slot_v1 kernel support"))
+			}
+		}
 		if i > 0 && cfg.Boot.Disks[i-1].Name != shape.Name {
 			return fail(fmt.Errorf("launch disk %d identity mismatch", i))
 		}
@@ -874,6 +933,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			return fail(err)
 		}
 	}
+	phase("retain_plan")
 	cacheSize, dirtySize, err := cfg.Resources.DiffCOW.Bytes()
 	if err != nil {
 		return fail(err)
@@ -990,7 +1050,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		opts := []diffstore.DiskOption{diffstore.WithCache(cache)}
 		if r.spec.EnableCheckpoint {
 			binding := r.spec.checkpointPlan.Disks[index]
-			opts = append(opts, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID))
+			opts = append(opts, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID), diffstore.WithDurableFlush())
 		}
 		if owned {
 			opts = append(opts, diffstore.WithDiscardOnClose())
@@ -1049,6 +1109,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		r.spec.checkpointReleaseSources = nil
 	}
 
+	phase("open_disks")
 	ls, err := MergeLaunch(imageCfg, cfg.Launch)
 	if err != nil {
 		return fail(err)
@@ -1095,6 +1156,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err != nil {
 		return fail(err)
 	}
+	phase("install_launch")
 	workHeld = false
 	r.workMu.Unlock()
 	// Facts may precede ACK/MUX, but success cannot. A failed Guest fact must
@@ -1117,6 +1179,7 @@ wait:
 		started := r.initialLaunchState.State == proto.InitialLaunchStarted
 		r.mu.Unlock()
 		if succeeded {
+			phase("guest_started")
 			launched = true
 			return nil
 		}
@@ -1502,6 +1565,18 @@ func (r *Runtime) Stats(ctx context.Context) (*ctl.ResourceStats, error) {
 // A destroy-mode result schedules teardown after the capture is committed.
 func (r *Runtime) Snapshot(ctx context.Context, req ctl.Request) (ctl.Response, error) {
 	return r.capture(ctx, req, false)
+}
+
+// ForkDiskBarrier durably branches the native disks under the guest/VM
+// barrier, then invokes a trusted private-RAM fork coordinator. The source
+// resumes on success and failure. No RAM snapshot is produced.
+func (r *Runtime) ForkDiskBarrier(ctx context.Context, req ctl.Request, handoff func(context.Context, string, string) error) (ctl.Response, error) {
+	if !r.spec.PrivateRAMFork || handoff == nil {
+		return ctl.Response{}, errors.New("private RAM runtime and fork handoff required")
+	}
+	req.ResumeAfter = true
+	req.ForkDiskHandoff = handoff
+	return r.capture(ctx, req, true)
 }
 
 // Export captures portable workload disk state without changing the format.

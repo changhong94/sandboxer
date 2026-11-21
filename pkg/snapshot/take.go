@@ -36,10 +36,14 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
-	MemoryLayout MemoryLayout // standalone callers with an existing stable layout
+	PrivateRAMFork bool
+	MemoryLayout   MemoryLayout // standalone callers with an existing stable layout
 	// CaptureMemory collects CH logs then freezes M/D/R after snapshot writes.
 	CaptureMemory    func(context.Context) (*memory.CaptureView, error)
 	MemoryWorkingSet bool
+	// BeginLiveMemory installs before-image protection with all writers stopped.
+	BeginLiveMemory func(context.Context, *memory.CaptureView) (*memory.CoWCapture, error)
+	ResumeGuest     func() error
 	// MemoryFallbackBase is the full owned history, before dirty trimming.
 	MemoryFallbackBase sparse.Source
 	// MemoryProofCandidates is a diagnostic bitmap-only history union, never an output selection.
@@ -102,6 +106,7 @@ type DiskDiff struct {
 	DeleteCheckpoint func(context.Context, string) error
 	WaitMaterialized func(context.Context) error
 	Export           func(context.Context) (ExportView, error)
+	OpenCheckpoint   func(context.Context, string) (ExportView, error)
 	Path             string
 	Owned            bool
 	MergeBase        string
@@ -245,25 +250,47 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, err
 	}
 
-	// T3: capture all disks once and emit Sandbox E while the same CH/backend
-	// freeze remains held. E is a dependency, not yet the operation root.
 	dumpStart := time.Now()
-	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
-		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
-		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
-		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
-		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
-		MergeBaseOpener: s.MergeBaseOpener,
-	}, sink, false)
-	if err != nil {
-		return nil, err
-	}
-	out.SandboxRef, out.SandboxPath = sandboxOut.SandboxRef, sandboxOut.SandboxPath
-
-	// T4: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
-	// there (small); the multi-GiB memory + disk never touch the staging tmpfs —
-	// they stream straight to the sink.
-	if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
+	if s.PrivateRAMFork {
+		// Freeze disk generations before forking RAM. Persistence consumes only
+		// these pinned views after the original guest has resumed.
+		privateLive := resumeAfter && s.CheckpointID == "" && s.ResumeGuest != nil
+		for _, d := range s.Diffs {
+			if d.SnapshotView != nil && (d.Checkpoint == nil || d.OpenCheckpoint == nil || d.DeleteCheckpoint == nil) {
+				privateLive = false
+			}
+		}
+		if privateLive {
+			frozen, closeDisks, freezeErr := freezeLiveDisks(ctx, s.Diffs)
+			if freezeErr != nil {
+				return nil, freezeErr
+			}
+			defer func() { retErr = errors.Join(retErr, closeDisks()) }()
+			s.Diffs = frozen
+		}
+		operation, captureErr := ch.CapturePrivate(ctx, s.StagingDir)
+		if captureErr != nil {
+			return nil, fmt.Errorf("private capture: %w", captureErr)
+		}
+		if err := ch.WaitFork(ctx, operation.ID); err != nil {
+			return nil, err
+		}
+		if privateLive {
+			s.Quiescer.Resume()
+			backendsResumed = true
+			if err := ch.Resume(); err != nil {
+				return nil, err
+			}
+			resumed = true
+			if err := s.ResumeGuest(); err != nil {
+				return nil, err
+			}
+			logf("private live capture: parent resumed before persistence pause_ms=%.3f", float64(time.Since(pauseStart).Microseconds())/1000)
+		}
+		if err := waitPrivateCapture(ctx, s.StagingDir); err != nil {
+			return nil, err
+		}
+	} else if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
 		return nil, fmt.Errorf("CH snapshot: %w", err)
 	}
 	configJSON, err := os.ReadFile(filepath.Join(s.StagingDir, "config.json"))
@@ -275,21 +302,46 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, fmt.Errorf("read state.json: %w", err)
 	}
 
-	// T5: the memory-only snapshot.cfg points at E and carries only the memory
-	// parent chain.
-	snapshotCfg, err := MarshalConfig(&Config{
-		Version: SnapshotConfigVersion, SandboxRef: out.SandboxRef,
-		FromRefs: append([]string(nil), s.MemoryFromRefs...),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
-	}
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
 	// the mapping is stable); only resident pages are read/transferred.
+	live := !s.PrivateRAMFork && resumeAfter && s.CheckpointID == "" && s.CaptureMemory != nil && s.BeginLiveMemory != nil && s.ResumeGuest != nil
+	// Legacy/non-versioned disks keep the quiesced path; do not resume over an
+	// active export. Native runners enable checkpoint-capable disks.
+	for _, d := range s.Diffs {
+		if d.SnapshotView != nil && (d.Checkpoint == nil || d.OpenCheckpoint == nil || d.DeleteCheckpoint == nil) {
+			live = false
+		}
+	}
+	if live {
+		frozen, closeDisks, err := freezeLiveDisks(ctx, s.Diffs)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { retErr = errors.Join(retErr, closeDisks()) }()
+		s.Diffs = frozen
+	}
 	var memorySource sparse.Source
 	var dirty []byte
 	var workingMemory sparse.Source
-	if s.CaptureMemory != nil {
+	if s.PrivateRAMFork {
+		frozen, openErr := os.Open(filepath.Join(s.StagingDir, "memory-ranges"))
+		if openErr != nil {
+			return nil, openErr
+		}
+		defer frozen.Close()
+		stat, statErr := frozen.Stat()
+		if statErr != nil {
+			return nil, statErr
+		}
+		if stat.Size() != s.MemfdSize {
+			return nil, fmt.Errorf("private capture RAM size %d != %d", stat.Size(), s.MemfdSize)
+		}
+		holes, layoutErr := WalkHoles(int(frozen.Fd()), stat.Size())
+		if layoutErr != nil {
+			return nil, layoutErr
+		}
+		memorySource = privateCaptureSource(int(frozen.Fd()), uint64(stat.Size()), holes, &s)
+	} else if s.CaptureMemory != nil {
 		view, err := s.CaptureMemory(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("capture memory view: %w", err)
@@ -300,11 +352,39 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		if view.Size != uint64(s.MemfdSize) {
 			return nil, fmt.Errorf("capture memory size mismatch")
 		}
-		memorySource, dirty, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, s.MemoryWorkingSet)
+		var reader io.ReaderAt = fdReaderAt(s.MemfdFD)
+		if live {
+			if err := ch.CaptureProtect(true); err != nil {
+				return nil, fmt.Errorf("protect capture discards: %w", err)
+			}
+			capture, beginErr := s.BeginLiveMemory(ctx, view)
+			defer func() {
+				var closeErr error
+				if capture != nil {
+					logf("live capture: before_image_bytes=%d ram_bytes=%d", capture.CopiedBytes(), s.MemfdSize)
+					closeErr = capture.Close()
+				}
+				// Never enable discard until every protection is released.
+				if closeErr == nil {
+					closeErr = ch.CaptureProtect(false)
+				}
+				if closeErr != nil {
+					retErr = errors.Join(retErr, ErrLiveProtectionRecovery, closeErr)
+				}
+			}()
+			if beginErr != nil {
+				return nil, beginErr
+			}
+			if capture == nil {
+				return nil, fmt.Errorf("live capture: missing memory owner")
+			}
+			reader = capture
+		}
+		memorySource, dirty, err = CaptureMemory(reader, view, s.MemoryWorkingSet)
 		if err != nil {
 			return nil, err
 		}
-		workingMemory, _, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, true)
+		workingMemory, _, err = CaptureMemory(reader, view, true)
 		if err != nil {
 			return nil, err
 		}
@@ -319,6 +399,41 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			return nil, fmt.Errorf("memory layout: %w", err)
 		}
 		memorySource = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
+	}
+	if live {
+		s.Quiescer.Resume()
+		backendsResumed = true
+		if err := ch.Resume(); err != nil {
+			return nil, fmt.Errorf("live CH resume: %w", err)
+		}
+		resumed = true
+		if err := s.ResumeGuest(); err != nil {
+			return nil, fmt.Errorf("live guest resume: %w", err)
+		}
+		logf("live capture: parent resumed before persistence pause_ms=%.3f", float64(time.Since(pauseStart).Microseconds())/1000)
+	}
+	// T3: capture all disks once and emit Sandbox E while the same CH/backend
+	// freeze remains held. E is a dependency, not yet the operation root.
+	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
+		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
+		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
+		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
+		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
+		MergeBaseOpener: s.MergeBaseOpener,
+	}, sink, false)
+	if err != nil {
+		return nil, err
+	}
+	out.SandboxRef, out.SandboxPath = sandboxOut.SandboxRef, sandboxOut.SandboxPath
+
+	// T5: the memory-only snapshot.cfg points at E and carries only the memory
+	// parent chain.
+	snapshotCfg, err := MarshalConfig(&Config{
+		Version: SnapshotConfigVersion, SandboxRef: out.SandboxRef,
+		FromRefs: append([]string(nil), s.MemoryFromRefs...),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
 	}
 	if workingMemory == nil {
 		workingMemory = memorySource
@@ -391,7 +506,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	dumpEnd := time.Now()
 
 	// T8: resume (destroy path handled by caller).
-	if resumeAfter {
+	if resumeAfter && !resumed {
 		s.Quiescer.Resume()
 		backendsResumed = true
 		if err := ch.Resume(); err != nil {

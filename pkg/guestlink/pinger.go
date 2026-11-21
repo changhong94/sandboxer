@@ -2,10 +2,14 @@ package guestlink
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -389,11 +393,60 @@ func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkS
 
 // OpenMUXViaRestoreContext is OpenMUXViaRestore with cancellation covering
 // both the pre-request CONNECT/OK retry window and the one-shot restore_ack.
-func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration, initialization ...*RestoreInitialization) (net.Conn, proto.StdioSpec, error) {
+	return openMUXRestore(ctx, client, epoch, network, deadline, network != nil && network.MAC != "", initialization...)
+}
+
+// OpenMUXViaForkContext requires the fork-specific guest ACK, including for
+// guests without a NIC. This prevents silently skipping identity renewal.
+func OpenMUXViaForkContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration, initialization ...*RestoreInitialization) (net.Conn, proto.StdioSpec, error) {
+	return openMUXRestore(ctx, client, epoch, network, deadline, true, initialization...)
+}
+
+type RestoreInitialization struct {
+	Body      json.RawMessage
+	Confirmed bool
+}
+
+func openMUXRestore(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration, fork bool, initialization ...*RestoreInitialization) (net.Conn, proto.StdioSpec, error) {
+	var body json.RawMessage
+	var confirmed *bool
+	if len(initialization) > 1 {
+		return nil, proto.StdioSpec{}, fmt.Errorf("multiple restore initializations")
+	}
+	if len(initialization) == 1 && initialization[0] != nil {
+		body = initialization[0].Body
+		confirmed = &initialization[0].Confirmed
+		*confirmed = false
+	}
+	timing := os.Getenv("CH_FORK_TIMING") != ""
+	start := time.Now()
+	startTID := syscall.Gettid()
+	startCPU := connectionProcessCPU()
+	var dialCPU int64
+	var dialTID int
+	var dialDone time.Time
+	defer func() {
+		if timing && client.Logf != nil && !dialDone.IsZero() {
+			client.Logf("restore connection stages start_ns=%d dial_ns=%d request_ack_ns=%d pid=%d start_tid=%d dial_tid=%d end_tid=%d dial_process_cpu_ns=%d ack_process_cpu_ns=%d", start.UnixNano(), dialDone.Sub(start).Nanoseconds(), time.Since(dialDone).Nanoseconds(), os.Getpid(), startTID, dialTID, syscall.Gettid(), dialCPU-startCPU, connectionProcessCPU()-dialCPU)
+		}
+	}()
+
+	var seed []byte
+	if fork {
+		seed = make([]byte, 32)
+		if _, err := rand.Read(seed); err != nil {
+			return nil, proto.StdioSpec{}, err
+		}
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	conn, err := dialRawForRestoreContext(ctx, client, deadline, restoreDialAttemptTimeout)
+	dialDone = time.Now()
+	dialTID = syscall.Gettid()
+	dialCPU = connectionProcessCPU()
 	if err != nil {
 		return nil, proto.StdioSpec{}, err
 	}
@@ -402,13 +455,19 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 	// WallclockNs requests a best-effort CLOCK_REALTIME adjustment because
 	// CH reloads the snapshot's stale clock. Capture after connecting, near
 	// the send; this does not bound propagation or guest scheduling delay.
+	requestType, ackType := proto.TypeRestore, proto.TypeRestoreAck
+	if fork {
+		requestType, ackType = proto.TypeForkRestore, proto.TypeForkRestoreAck
+	}
 	rawConn := conn
 	resultConn, spec, err := finishOpenMUX(rawConn, &proto.Message{
-		Type:        proto.TypeRestore,
-		Epoch:       epoch,
-		WallclockNs: time.Now().UnixNano(),
-		Network:     network,
-	}, proto.TypeRestoreAck)
+		RestoreEnvdInit: body,
+		Type:            requestType,
+		ForkEntropy:     seed,
+		Epoch:           epoch,
+		WallclockNs:     time.Now().UnixNano(),
+		Network:         network,
+	}, ackType, confirmed)
 	if !stopCancel() {
 		_ = rawConn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -614,7 +673,7 @@ func openMUXViaExecContext(ctx context.Context, client *HostClient, spec *proto.
 	return resultConn, established, nil
 }
 
-func finishOpenMUX(conn net.Conn, req *proto.Message, wantAck string) (net.Conn, proto.StdioSpec, error) {
+func finishOpenMUX(conn net.Conn, req *proto.Message, wantAck string, initialized ...*bool) (net.Conn, proto.StdioSpec, error) {
 	if err := proto.WriteMessage(conn, req); err != nil {
 		_ = conn.Close()
 		return nil, proto.StdioSpec{}, fmt.Errorf("write %s: %w", req.Type, err)
@@ -627,6 +686,9 @@ func finishOpenMUX(conn net.Conn, req *proto.Message, wantAck string) (net.Conn,
 	if resp.Type != wantAck {
 		_ = conn.Close()
 		return nil, proto.StdioSpec{}, &protoMismatchErr{want: wantAck, got: resp.Type, msg: resp.Msg}
+	}
+	if len(initialized) == 1 && initialized[0] != nil {
+		*initialized[0] = resp.RestoreEnvdInitialized
 	}
 	// Hand-off: the MUX session manages its own per-frame timing.
 	_ = conn.SetDeadline(time.Time{})
@@ -646,4 +708,14 @@ func (e *protoMismatchErr) Error() string {
 		return "proto: want " + e.want + ", got " + e.got + " (msg=" + e.msg + ")"
 	}
 	return "proto: want " + e.want + ", got " + e.got
+}
+
+// CPU is for the entire process, including unrelated goroutines. It is not
+// attributed to the current task or to the OS thread sampled at this boundary.
+func connectionProcessCPU() int64 {
+	var t unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_PROCESS_CPUTIME_ID, &t) != nil {
+		return -1
+	}
+	return t.Nano()
 }

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
@@ -62,6 +64,7 @@ type Publisher struct {
 	completion         *publishCompletion
 	transientLocations map[string]bool
 	checkpointPins     *PinnedDiffCheckpoints
+	linkImmutableDisks bool
 }
 
 type publishTarget interface {
@@ -554,6 +557,12 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 }
 
 func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishScope, use rewriteUse) (ref string, retErr error) {
+	if p.linkImmutableDisks {
+		started := time.Now()
+		defer func() {
+			log.Printf("[native disk branch] dependency=%s elapsed=%s error=%v", raw, time.Since(started), retErr)
+		}()
+	}
 	p.original(raw, scope)
 	defer func() {
 		if retErr == nil {
@@ -608,6 +617,15 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 			p.memoMu.Unlock()
 		}
 	}()
+	if p.linkImmutableDisks {
+		if target, ok := p.target.(*locationPublishTarget); ok {
+			if opened, ok := stream.(*OpenedFile); ok {
+				if linked, used, err := target.linkImmutableDisk(ctx, role, opened, payload); used || err != nil {
+					return linked, err
+				}
+			}
+		}
+	}
 	return p.target.Put(ctx, role, payload)
 }
 

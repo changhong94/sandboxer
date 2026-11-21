@@ -150,14 +150,16 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 	if err := ValidateDirty(tailzip.Section{Source: stream, Length: base}, bodies[MemoryDirtyName]); err != nil {
 		return fail(err)
 	}
+	// parseArchive allocated private buffers for this Open; transfer ownership
+	// directly instead of copying the captured device state a second time.
 	owner := &streamOwner{stream: stream}
 	return &Root{
 		FullStream:     &sectionStream{owner: owner, size: stream.Size()},
 		Memory:         &sectionStream{owner: owner, size: base},
-		ConfigJSON:     append([]byte(nil), bodies[ConfigJSONName]...),
-		StateJSON:      append([]byte(nil), bodies[StateJSONName]...),
-		SnapshotConfig: append([]byte(nil), bodies[SnapshotCfgName]...),
-		MemoryDirty:    append([]byte(nil), bodies[MemoryDirtyName]...),
+		ConfigJSON:     bodies[ConfigJSONName][:len(bodies[ConfigJSONName]):len(bodies[ConfigJSONName])],
+		StateJSON:      bodies[StateJSONName][:len(bodies[StateJSONName]):len(bodies[StateJSONName])],
+		SnapshotConfig: bodies[SnapshotCfgName][:len(bodies[SnapshotCfgName]):len(bodies[SnapshotCfgName])],
+		MemoryDirty:    bodies[MemoryDirtyName][:len(bodies[MemoryDirtyName]):len(bodies[MemoryDirtyName])],
 		ArchiveBase:    base, owner: owner,
 	}, nil
 }

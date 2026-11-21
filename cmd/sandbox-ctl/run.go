@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/readiness"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	runtimesdk "github.com/kuasar-sandbox/sandboxer/pkg/runtime"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -43,9 +47,23 @@ import (
 // --run-root defaults to SANDBOX_RUN_ROOT env or "/run/sandbox" (tmpfs:
 // sockets + snap staging). --base-root defaults to SANDBOX_BASE_ROOT env or
 // "/var/lib/sandbox" (on-disk: the overlay diff).
-func runCmd(args []string) int {
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+func runCmd(args []string) int { return runCmdPrepared(args, nil) }
 
+func runCmdPrepared(args []string, prepared *sandbox.Runtime, sharedCgroup ...*os.File) int {
+	return runCmdPreparedRestore(args, prepared, nil, sharedCgroup...)
+}
+func runCmdPreparedRestore(args []string, prepared *sandbox.Runtime, restored *sandbox.PreparedRestore, sharedCgroup ...*os.File) int {
+	return runCmdPreparedSource(args, prepared, restored, nil, sharedCgroup...)
+}
+func runCmdPreparedSource(args []string, prepared *sandbox.Runtime, restored *sandbox.PreparedRestore, sources *restore.PreparedSources, sharedCgroup ...*os.File) int {
+	markStage, flushStages := traceLaunchStages("vmm_cli")
+	defer flushStages()
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	restoreEnvd := fs.Bool("restore-envd-init", false, "initialize envd before restore readiness using private runner environment")
+	nativeParent := fs.String("native-fork-parent", "", "host-authorized direct RAM fork source")
+	nativeCID := fs.Uint("native-child-cid", 0, "allocated child vsock CID")
+
+	privateRAMFork := fs.Bool("private-ram-fork", false, "use private guest RAM and native disk transport for same-host fork")
 	enableCheckpoint := fs.Bool("enable-checkpoint", false, "retain versioned writable disks in BaseRoot/PathID/checkpoint")
 	retainInstance := fs.String("retain-instance", "", "parent object instance owning the current disks (requires --run-id and --enable-checkpoint)")
 	currentRunID := fs.String("run-id", "", "exact run identity for retained current disks")
@@ -63,7 +81,9 @@ func runCmd(args []string) int {
 	statsJSON := fs.String("stats-json", "", "if set, write per-backend + uffd stats as JSON to this path on shutdown")
 	readyFD := fs.Int("ready-fd", -1, "write control_ready and ready events to an inherited fd")
 
+	sandboxHint := fs.String("restore-sandbox-hint", "", "optional speculative source; verified against authenticated snapshot")
 	fromRef := fs.String("from", "", "Sandbox artifact reference — cold-start its portable workload and root payload")
+	forkIdentity := fs.Bool("fork-identity", false, "renew guest identity when restoring a new fork child")
 	restoreRef := fs.String("restore", "", "Snapshot reference — restore memory and VMM execution state")
 	replaceBoot := fs.Bool("replace-boot", false, "with --from, replace the complete boot definition from host config")
 
@@ -107,6 +127,11 @@ func runCmd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	if *privateRAMFork && (!*enableCheckpoint) {
+		fmt.Fprintln(os.Stderr, "private RAM run requires checkpoint disks")
+		return 2
+	}
+
 	diagnostics, closeLog, err := componentLog(*logTo)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox-ctl run: --log-to: %v\n", err)
@@ -169,6 +194,18 @@ func runCmd(args []string) int {
 		// Every subsequent return closes the descriptor, so startup failure is
 		// represented by EOF (possibly after control_ready).
 		defer readyWriter.Close()
+	}
+	var envdBody []byte
+	var envdSocket string
+	if *restoreEnvd {
+		envdBody = []byte(os.Getenv("KUASAR_RESTORE_ENVD_INIT"))
+		envdSocket = os.Getenv("KUASAR_RESTORE_ENVD_SOCKET")
+		_ = os.Unsetenv("KUASAR_RESTORE_ENVD_INIT")
+		_ = os.Unsetenv("KUASAR_RESTORE_ENVD_SOCKET")
+		if len(envdBody) == 0 || len(envdBody) > 512<<10 || !json.Valid(envdBody) || !filepath.IsAbs(envdSocket) || *restoreRef == "" || *nativeParent != "" {
+			fmt.Fprintln(os.Stderr, "invalid restore envd initialization")
+			return 2
+		}
 	}
 	var notifyReadiness sandbox.ReadinessNotify
 	if readyWriter != nil {
@@ -282,6 +319,7 @@ func runCmd(args []string) int {
 		fmt.Fprintln(diagnostics, "sandbox-ctl run: --config or SANDBOX_CONFIG required")
 		return 2
 	}
+	markStage("flags_stdio_paths")
 	var (
 		cfg      *config.SandboxConfig
 		presence config.FieldPresence
@@ -289,7 +327,7 @@ func runCmd(args []string) int {
 	if *configPath == "" {
 		cfg = &config.SandboxConfig{}
 		cfg.ApplyDefaults()
-	} else if *fromRef != "" || *restoreRef != "" {
+	} else if *fromRef != "" || *restoreRef != "" || *nativeParent != "" {
 		cfg, presence, err = config.LoadMergedWithPresence(strings.Split(*configPath, ":"))
 		if err != nil {
 			fmt.Fprintln(diagnostics, err)
@@ -303,6 +341,7 @@ func runCmd(args []string) int {
 			return 1
 		}
 	}
+	markStage("host_config")
 	manifestCfg, err := config.LoadManifestConfig(*manifestPath)
 	if err != nil {
 		if !errors.Is(err, manifest.ErrConfigNotProvided) {
@@ -311,11 +350,14 @@ func runCmd(args []string) int {
 		}
 		manifestCfg = nil
 	}
+	markStage("manifest_config")
 	processStorage, err := newCLIStorage(manifestCfg)
 	if err != nil {
 		fmt.Fprintf(diagnostics, "[sandbox-ctl] local crypto: %v\n", err)
 		return 1
 	}
+	markStage("process_storage")
+	flushStages()
 	defer processStorage.Close()
 	keyFn := processStorage.CustomerKeyFunc()
 	manifestFetcher := processStorage.Fetcher()
@@ -324,13 +366,27 @@ func runCmd(args []string) int {
 
 	// cgroup overrides.
 	if *cgroupPath != "" {
-		resolved, inherited, rerr := resolveCgroupPathArg(*cgroupPath)
+		var resolved string
+		var inherited *os.File
+		var rerr error
+		if len(sharedCgroup) > 0 && sharedCgroup[0] != nil {
+			inherited = sharedCgroup[0]
+			if *cgroupPath != fmt.Sprintf("fd=%d", inherited.Fd()) {
+				fmt.Fprintln(diagnostics, "prepared cgroup descriptor changed")
+				return 2
+			}
+			resolved, rerr = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", inherited.Fd()))
+		} else {
+			resolved, inherited, rerr = resolveCgroupPathArg(*cgroupPath)
+		}
 		if rerr != nil {
 			fmt.Fprintf(diagnostics, "[sandbox-ctl] --cgroup-path: %v\n", rerr)
 			return 1
 		}
 		if inherited != nil {
-			defer inherited.Close()
+			if len(sharedCgroup) == 0 {
+				defer inherited.Close()
+			}
 			cfg.Resources.Control.CgroupFD = int(inherited.Fd())
 		}
 		cfg.Resources.Control.CgroupPath = resolved
@@ -356,10 +412,51 @@ func runCmd(args []string) int {
 			return 2
 		}
 	}
+	if *nativeParent != "" {
+		if prepared != nil || restoreR != "" || *fromRef != "" || !*enableCheckpoint || *nativeCID <= 2 || uint64(*nativeCID) >= uint64(^uint32(0)) {
+			fmt.Fprintln(diagnostics, "invalid native fork launch combination")
+			return 2
+		}
+		if err := validateSandboxIDArg(*nativeParent); err != nil {
+			fmt.Fprintln(diagnostics, err)
+			return 2
+		}
+		result, err := runtimesdk.ForkNative(ctx, runtimesdk.LocalForkSource{Socket: filepath.Join(rd, *nativeParent, "ctl.sock"), SandboxID: *nativeParent}, runtimesdk.NativeForkSpec{
+			Capture: ctl.Request{CheckpointID: fmt.Sprintf("fork-%s", *sandboxID)}, ParentAPISocket: filepath.Join(rd, *nativeParent, "ch.sock"), ChildCID: uint32(*nativeCID),
+			Child: runtimesdk.RestoreSpec{EnableCheckpoint: true, CurrentRun: currentRun, ManifestCfg: manifestCfg, Fetcher: manifestFetcher, CustomerKeyFn: keyFn, LocalCodec: localCodec, LocalRequired: localRequired, RefLocations: refLocations, SandboxID: *sandboxID, PathID: *pathID, RuntimeRoot: rd, BaseRoot: br, HostCfg: cfg, HostPresence: presence, CHBinary: chBin, StdioMode: stdioMode, Forwards: forwards}})
+		if err != nil {
+			fmt.Fprintln(diagnostics, err)
+			return 1
+		}
+		defer result.Child.Close()
+		if notifyReadiness != nil {
+			notifyReadiness(sandbox.ReadinessControlReady)
+			notifyReadiness(sandbox.ReadinessRuntimeReady)
+			notifyReadiness(sandbox.ReadinessReady)
+		}
+		code, err := sandbox.WaitRun(ctx, result.Child)
+		if err != nil {
+			fmt.Fprintln(diagnostics, err)
+			return 1
+		}
+		return code
+	}
+	if *forkIdentity && restoreR == "" {
+		fmt.Fprintln(diagnostics, "--fork-identity requires --restore")
+		return 2
+	}
+	if restored != nil && restoreR == "" {
+		fmt.Fprintln(os.Stderr, "prepared restore holder requires memory restore")
+		return 1
+	}
 	if restoreR != "" {
+		if prepared != nil {
+			fmt.Fprintln(diagnostics, "prepared VM cannot accept memory restore")
+			return 2
+		}
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{Checkpoint: *enableCheckpoint, CurrentRun: currentRun})
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, runRetentionOptions{RestoreEnvdInit: envdBody, RestoreEnvdSocket: envdSocket, Sources: sources, SandboxHint: *sandboxHint, PreparedRestore: restored, PrivateRAMFork: *privateRAMFork, Checkpoint: *enableCheckpoint, CurrentRun: currentRun, ForkIdentity: *forkIdentity})
 	}
 
 	var sourceLaunch sandbox.LaunchSpec
@@ -387,8 +484,15 @@ func runCmd(args []string) int {
 		}
 	}
 
-	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
+	run := sandbox.Run
+	if prepared != nil {
+		run = func(ctx context.Context, opts sandbox.RunOptions) (int, error) {
+			return sandbox.RunPreparedOrCold(ctx, prepared, opts)
+		}
+	}
+	exit, err := run(ctx, sandbox.RunOptions{
 		EnableCheckpoint:   *enableCheckpoint,
+		PrivateRAMFork:     *privateRAMFork,
 		CurrentRun:         currentRun,
 		Cfg:                cfg,
 		PortableConfig:     sourceLaunch.PortableConfig,
@@ -422,8 +526,15 @@ func runCmd(args []string) int {
 }
 
 type runRetentionOptions struct {
-	Checkpoint bool
-	CurrentRun *artifact.CurrentRun
+	RestoreEnvdInit   []byte
+	RestoreEnvdSocket string
+	Sources           *restore.PreparedSources
+	SandboxHint       string
+	PreparedRestore   *sandbox.PreparedRestore
+	PrivateRAMFork    bool
+	ForkIdentity      bool
+	Checkpoint        bool
+	CurrentRun        *artifact.CurrentRun
 }
 
 // runRestore parses the snapshot reference and waits on the SDK restore owner.
@@ -479,6 +590,12 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 		retention = checkpointOptions[0]
 	}
 	runtime, err := runtimesdk.Restore(ctx, runtimesdk.RestoreSpec{
+		RestoreEnvdInit: retention.RestoreEnvdInit, RestoreEnvdSocket: retention.RestoreEnvdSocket,
+		PreparedSources:     retention.Sources,
+		SandboxRefHint:      retention.SandboxHint,
+		PreparedRestore:     retention.PreparedRestore,
+		ForkNetworkIdentity: retention.ForkIdentity,
+		PrivateRAMFork:      retention.PrivateRAMFork,
 		EnableCheckpoint:    retention.Checkpoint,
 		CurrentRun:          retention.CurrentRun,
 		SnapshotPath:        snapshotPath,

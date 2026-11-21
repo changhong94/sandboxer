@@ -1,0 +1,292 @@
+From ec320924f04d52cea7d2b6b6686463aa404c1543 Mon Sep 17 00:00:00 2001
+From: Native fork migration <native-fork@localhost>
+Date: Thu, 19 Nov 2026 19:28:32 -0700
+Subject: [PATCH] memory: support shared-memfd write-protected live capture
+
+---
+ virtio-devices/src/balloon.rs     | 21 ++++++++++++++++---
+ vmm/src/api/http/http_endpoint.rs |  3 ++-
+ vmm/src/api/http/mod.rs           |  6 +++++-
+ vmm/src/api/mod.rs                | 34 +++++++++++++++++++++++++++++++
+ vmm/src/device_manager.rs         |  4 ++++
+ vmm/src/lib.rs                    |  5 +++++
+ vmm/src/memory_manager.rs         | 13 +++++++++---
+ vmm/src/vm.rs                     |  8 ++++++++
+ 8 files changed, 86 insertions(+), 8 deletions(-)
+
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index a60a68d..29753b6 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -18,7 +18,7 @@ use std::io::{self, Write};
+ use std::mem::size_of;
+ use std::os::unix::io::AsRawFd;
+ use std::result;
+-use std::sync::atomic::AtomicBool;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Barrier};
+ 
+ use anyhow::anyhow;
+@@ -152,6 +152,7 @@ const CONFIG_ACTUAL_SIZE: usize = 4;
+ unsafe impl ByteValued for VirtioBalloonConfig {}
+ 
+ struct BalloonEpollHandler {
++    capture_active: Arc<AtomicBool>,
+     mem: GuestMemoryAtomic<GuestMemoryMmap>,
+     queues: Vec<Queue>,
+     interrupt_cb: Arc<dyn VirtioInterrupt>,
+@@ -337,7 +338,10 @@ impl BalloonEpollHandler {
+                 return Err(Error::InvalidRequest);
+             }
+ 
+-            if queue_index == 0 && self.coalesce_inflate {
++            if self.capture_active.load(Ordering::SeqCst) {
++                // Acknowledge the hint without discarding captured storage.
++                // A later report can reclaim it once the capture closes.
++            } else if queue_index == 0 && self.coalesce_inflate {
+                 Self::release_inflate_descriptor(
+                     desc_chain.memory(),
+                     desc.addr(),
+@@ -395,7 +399,9 @@ impl BalloonEpollHandler {
+             let mut descs_len = 0;
+             while let Some(desc) = desc_chain.next() {
+                 descs_len += desc.len();
+-                Self::release_memory_range(desc_chain.memory(), desc.addr(), desc.len() as usize)?;
++                if !self.capture_active.load(Ordering::SeqCst) {
++                    Self::release_memory_range(desc_chain.memory(), desc.addr(), desc.len() as usize)?;
++                }
+             }
+ 
+             self.queues[queue_index]
+@@ -498,6 +504,7 @@ pub struct BalloonState {
+ 
+ // Virtio device for exposing entropy to the guest OS through virtio.
+ pub struct Balloon {
++    capture_active: Arc<AtomicBool>,
+     common: VirtioCommon,
+     coalesce_inflate: bool,
+     id: String,
+@@ -508,6 +515,12 @@ pub struct Balloon {
+ }
+ 
+ impl Balloon {
++    // Enabled only while paused, before any capture reads. The external owner
++    // releases this gate only after its memory reader has been detached.
++    pub fn set_capture_active(&self, active: bool) {
++        self.capture_active.store(active, Ordering::SeqCst);
++    }
++
+     // Create a new virtio-balloon.
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+@@ -555,6 +568,7 @@ impl Balloon {
+         }
+ 
+         Ok(Balloon {
++            capture_active: Arc::new(AtomicBool::new(false)),
+             common: VirtioCommon {
+                 device_type: VirtioDeviceType::Balloon as u32,
+                 avail_features,
+@@ -696,6 +710,7 @@ impl VirtioDevice for Balloon {
+         self.interrupt_cb = Some(interrupt_cb.clone());
+ 
+         let mut handler = BalloonEpollHandler {
++            capture_active: self.capture_active.clone(),
+             mem,
+             queues: virtqueues,
+             interrupt_cb,
+diff --git a/vmm/src/api/http/http_endpoint.rs b/vmm/src/api/http/http_endpoint.rs
+index a5a2ad0..1254243 100644
+--- a/vmm/src/api/http/http_endpoint.rs
++++ b/vmm/src/api/http/http_endpoint.rs
+@@ -46,7 +46,7 @@ use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_
+ use crate::api::http::{EndpointHandler, HttpError, error_response};
+ use crate::api::{
+     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem,
+-    VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmDirtyMemory,
++    VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmDirtyMemory, VmCaptureProtect,
+     VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize,
+     VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+ };
+@@ -407,6 +407,7 @@ macro_rules! vm_action_put_handler_body {
+ 
+ vm_action_get_handler!(VmCounters);
+ vm_action_get_handler!(VmDirtyMemory);
++vm_action_put_handler_body!(VmCaptureProtect);
+ 
+ vm_action_put_handler!(VmBoot);
+ vm_action_put_handler!(VmDelete);
+diff --git a/vmm/src/api/http/mod.rs b/vmm/src/api/http/mod.rs
+index 27823a4..e2485a9 100644
+--- a/vmm/src/api/http/mod.rs
++++ b/vmm/src/api/http/mod.rs
+@@ -29,7 +29,7 @@ use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdow
+ use crate::api::VmCoredump;
+ use crate::api::{
+     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem, VmAddUserDevice,
+-    VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmDirtyMemory, VmNmi, VmPause,
++    VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmDirtyMemory, VmCaptureProtect, VmNmi, VmPause,
+     VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+     VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+ };
+@@ -227,6 +227,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
+         Box::new(VmActionHandler::new(&VmDelete)),
+     );
+     r.routes.insert(endpoint!("/vm.info"), Box::new(VmInfo {}));
++    r.routes.insert(
++        endpoint!("/vm.capture-protect"),
++        Box::new(VmActionHandler::new(&VmCaptureProtect)),
++    );
+     r.routes.insert(
+         endpoint!("/vm.dirty-memory"),
+         Box::new(VmActionHandler::new(&VmDirtyMemory)),
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index 4e966fb..bd55543 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -348,6 +348,7 @@ pub trait RequestHandler {
+ 
+     fn vm_add_vsock(&mut self, vsock_cfg: VsockConfig) -> Result<Option<Vec<u8>>, VmError>;
+ 
++    fn vm_capture_protect(&mut self, enabled: bool) -> Result<Option<Vec<u8>>, VmError>;
+     fn vm_dirty_memory(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+     fn vm_counters(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+ 
+@@ -863,6 +864,39 @@ impl ApiAction for VmDirtyMemory {
+     }
+ }
+ 
++pub struct VmCaptureProtect;
++
++impl ApiAction for VmCaptureProtect {
++    type RequestBody = bool;
++    type ResponseBody = Option<Body>;
++
++    fn request(&self, enabled: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
++        Box::new(move |vmm| {
++            info!("API request event: VmCaptureProtect");
++
++            let response = vmm
++                .vm_capture_protect(enabled)
++                .map_err(ApiError::VmInfo)
++                .map(ApiResponsePayload::VmAction);
++
++            response_sender
++                .send(response)
++                .map_err(VmmError::ApiResponseSend)?;
++
++            Ok(false)
++        })
++    }
++
++    fn send(
++        &self,
++        api_evt: EventFd,
++        api_sender: Sender<ApiRequest>,
++        data: Self::RequestBody,
++    ) -> ApiResult<Self::ResponseBody> {
++        get_response_body(self, api_evt, api_sender, data)
++    }
++}
++
+ pub struct VmCreate;
+ 
+ impl ApiAction for VmCreate {
+diff --git a/vmm/src/device_manager.rs b/vmm/src/device_manager.rs
+index 0f8513e..221618b 100644
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -3545,6 +3545,10 @@ impl DeviceManager {
+         Ok((pvmemcontrol_bus_device, pvmemcontrol_pci_device))
+     }
+ 
++    pub fn set_capture_active(&self, active: bool) {
++        if let Some(balloon) = &self.balloon { balloon.lock().unwrap().set_capture_active(active); }
++    }
++
+     fn make_virtio_balloon_devices(&mut self) -> DeviceManagerResult<()> {
+         if let Some(balloon_config) = &self.config.lock().unwrap().balloon {
+             let id = String::from(BALLOON_DEVICE_NAME);
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index 95b3a86..d8ad339 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -2231,6 +2231,11 @@ impl RequestHandler for Vmm {
+         }
+     }
+ 
++    fn vm_capture_protect(&mut self, enabled: bool) -> result::Result<Option<Vec<u8>>, VmError> {
++        if let Some(ref mut vm) = self.vm { vm.capture_protect(enabled)?; Ok(None) }
++        else { Err(VmError::VmNotRunning) }
++    }
++
+     fn vm_dirty_memory(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
+         if let Some(ref mut vm) = self.vm {
+             serde_json::to_vec(&vm.dirty_memory()?)
+diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
+index 91ad92a..a50f6e7 100644
+--- a/vmm/src/memory_manager.rs
++++ b/vmm/src/memory_manager.rs
+@@ -1580,7 +1580,7 @@ impl MemoryManager {
+         }
+         let mut api_req = UffdioApi {
+             api: UFFD_API,
+-            features: UFFD_FEATURE_MISSING_SHMEM
++            features: UFFD_FEATURE_MISSING_SHMEM | 1 // PAGEFAULT_FLAG_WP
+                 | UFFD_FEATURE_EVENT_REMOVE
+                 | UFFD_FEATURE_EVENT_UNMAP
+                 | UFFD_FEATURE_THREAD_ID,
+@@ -1597,7 +1597,14 @@ impl MemoryManager {
+             return Err(Error::UffdRegister(io::Error::last_os_error()));
+         }
+ 
+-        // UFFDIO_REGISTER MISSING on [addr, addr+size) in CH's mm.
++        // Optional shmem WP is negotiated by feature discovery. Unsupported
++        // kernels keep the old missing-only path; live capture fails before
++        // resume when its first WP ioctl is rejected.
++        const UFFD_FEATURE_WP_HUGETLBFS_SHMEM: u64 = 1 << 12;
++        const UFFD_FEATURE_PAGEFAULT_FLAG_WP: u64 = 1;
++        let write_protect = api_req.features & UFFD_FEATURE_WP_HUGETLBFS_SHMEM != 0
++            && api_req.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP != 0;
++        // UFFDIO_REGISTER MISSING plus optional WP in CH's mm.
+         const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
+         const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+         #[repr(C)]
+@@ -1616,7 +1623,7 @@ impl MemoryManager {
+                 start: addr,
+                 len: size as u64,
+             },
+-            mode: UFFDIO_REGISTER_MODE_MISSING,
++            mode: UFFDIO_REGISTER_MODE_MISSING | if write_protect { 2 } else { 0 },
+             ioctls: 0,
+         };
+         let r = unsafe {
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index fff0d40..94dd24d 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -111,6 +111,8 @@ use crate::{
+ /// Errors associated with VM management
+ #[derive(Debug, Error)]
+ pub enum Error {
++    #[error("Capture protection requires a paused VM when enabling")]
++    CaptureRequiresPause,
+     #[error("Cannot open kernel file")]
+     KernelFile(#[source] io::Error),
+ 
+@@ -2239,6 +2241,12 @@ impl Vm {
+         self.memory_manager.lock().unwrap().ensure_migration_supported()
+     }
+ 
++    pub fn capture_protect(&mut self, enabled: bool) -> Result<()> {
++        if enabled && self.get_state() != VmState::Paused { return Err(Error::CaptureRequiresPause); }
++        self.device_manager.lock().unwrap().set_capture_active(enabled);
++        Ok(())
++    }
++
+     pub fn dirty_memory(&mut self) -> Result<crate::dirty_memory::DirtyMemory> {
+         self.memory_manager
+             .lock()
+-- 
+2.34.1
+

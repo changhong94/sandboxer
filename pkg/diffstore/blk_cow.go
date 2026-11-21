@@ -22,21 +22,22 @@ import (
 // access; the worker never acquires them. Reopen loads committed presence;
 // fresh owners establish an independent empty bitmap before accepting writes.
 type Disk struct {
-	opMu      sync.RWMutex // lifetime of frontend operations; never taken by writeback
-	lifeCtx   context.Context
-	cancel    context.CancelFunc
-	closeOnce sync.Once
-	closeErr  error
-	cache     *Cache
-	ownCache  bool
-	base      BlockReader // optional; may be nil for no base layer
-	diff      diffBackend
-	versions  *checkpointDiff
-	size      int64
-	bitmapMu  sync.RWMutex
-	bitmap    []uint64 // each bit = logical presence of one 4 KiB block
-	blockMu   []sync.RWMutex
-	blockSize int64
+	durableFlush bool
+	opMu         sync.RWMutex // lifetime of frontend operations; never taken by writeback
+	lifeCtx      context.Context
+	cancel       context.CancelFunc
+	closeOnce    sync.Once
+	closeErr     error
+	cache        *Cache
+	ownCache     bool
+	base         BlockReader // optional; may be nil for no base layer
+	diff         diffBackend
+	versions     *checkpointDiff
+	size         int64
+	bitmapMu     sync.RWMutex
+	bitmap       []uint64 // each bit = logical presence of one 4 KiB block
+	blockMu      []sync.RWMutex
+	blockSize    int64
 
 	materialMu        sync.Mutex
 	materialReaders   sync.WaitGroup
@@ -125,6 +126,7 @@ func attachDisk(diff diffBackend, fresh *freshDiffInit, bitmap []uint64, base Bl
 	}
 
 	cow := &Disk{
+		durableFlush:   options.durableFlush,
 		base:           base,
 		diff:           diff,
 		size:           size,
@@ -616,9 +618,28 @@ func (c *Disk) WaitMaterialized(ctx context.Context) error {
 	}
 }
 
-// Flush is the project's non-durable guest FLUSH: health check only, with no
-// writeback wakeup, Drain or filesystem sync. Wire features remain unchanged.
-func (c *Disk) Flush() error { return c.Err() }
+// Flush preserves the upstream health-only policy unless durable operation was
+// explicitly selected. Persistent fork runtimes select it for their v4 disks.
+func (c *Disk) Flush() error {
+	if !c.durableFlush {
+		return c.Err()
+	}
+	if err := c.WaitMaterialReady(c.lifeCtx); err != nil {
+		return err
+	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	if err := c.Err(); err != nil {
+		return err
+	}
+	if err := c.cache.drain(c.lifeCtx, c); err != nil {
+		return err
+	}
+	if err := c.WaitMaterialized(c.lifeCtx); err != nil {
+		return err
+	}
+	return c.diff.Sync()
+}
 func (c *Disk) Err() error {
 	if err := c.cache.Err(); err != nil {
 		return err

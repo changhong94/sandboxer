@@ -43,7 +43,7 @@ func TestSnapshotCfgReaderSelectsNamedSnapshotAndSandbox(t *testing.T) {
 	}
 }
 
-func testSnapshotCfgProjection(t *testing.T, manifestCfg *config.ManifestConfig, codec tarstream.Codec, named bool) {
+func testSnapshotCfgProjection(t *testing.T, manifestCfg *config.ManifestConfig, codec tarstream.Codec, named bool, deferred ...bool) {
 	t.Helper()
 	const (
 		sha    = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -135,7 +135,23 @@ func testSnapshotCfgProjection(t *testing.T, manifestCfg *config.ManifestConfig,
 		input = locate(sRef)
 		rawInput = input
 	}
+	resolved := false
+	if len(deferred) > 0 && deferred[0] {
+		input = sPath
+		opts.RefLocations = config.RefLocations{}
+		opts.PrepareSandboxRef = func(raw string) error {
+			if raw != eRef {
+				t.Fatalf("unexpected selected E: %s", raw)
+			}
+			opts.RefLocations["refs"] = dir
+			resolved = true
+			return nil
+		}
+	}
 	document, err := reader.Read(ctx, input, opts)
+	if len(deferred) > 0 && deferred[0] && !resolved {
+		t.Fatal("paired E resolver was not called")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,4 +213,8 @@ func TestSnapshotCfgReaderRejectsLegacyDiskSchema(t *testing.T) {
 	if _, err := reader.Read(context.Background(), path, SnapshotCfgReadOptions{}); err == nil || !strings.Contains(err.Error(), "unsupported snapshot format/version") {
 		t.Fatalf("legacy reader error = %v", err)
 	}
+}
+
+func TestSnapshotCfgReaderResolvesNamedEAfterOpeningS(t *testing.T) {
+	testSnapshotCfgProjection(t, nil, nil, true, true)
 }

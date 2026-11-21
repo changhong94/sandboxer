@@ -315,7 +315,7 @@ func preflightExt4WithBase(ctx context.Context, base diffstore.BlockReader, root
 	var cowOptions []diffstore.DiskOption
 	if len(checkpointBindings) > 0 && checkpointBindings[0] != nil {
 		b := checkpointBindings[0]
-		cowOptions = append(cowOptions, diffstore.WithCheckpoint(b.DiffID, b.BaseID))
+		cowOptions = append(cowOptions, diffstore.WithCheckpoint(b.DiffID, b.BaseID), diffstore.WithDurableFlush())
 	}
 	if codec != nil {
 		cowOptions = append(cowOptions, diffstore.WithDiffEncryption(diffCustomerKey, required))

@@ -271,7 +271,13 @@ func (c *Disk) Checkpoint(ctx context.Context, id CheckpointID) error {
 	if err := c.WaitMaterialized(ctx); err != nil {
 		return err
 	}
-	return d.store.Checkpoint(ctx, string(id))
+	if err := d.store.Checkpoint(ctx, string(id)); err != nil {
+		return err
+	}
+	if c.durableFlush {
+		return d.store.Sync()
+	}
+	return nil
 }
 
 func (c *Disk) ListCheckpoints(ctx context.Context) ([]CheckpointID, error) {

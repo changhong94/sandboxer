@@ -68,15 +68,17 @@ var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
 // hypervisor master connects exactly once; on disconnect, the server
 // reaps virtq workers and stops.
 type Server struct {
-	capacityNotify   bool     // advertise CONFIG_CHANGE_MSG for dynamic slots
-	frontendReq      *os.File // guarded by mu
-	socketPath       string
-	backend          Backend
-	logf             func(format string, args ...any)
-	stats            *Stats
-	ctx              context.Context
-	onReadFatal      func(error)
-	discardSupported bool // fixed at device construction, including pooled devices
+	nativeCapacityNotify func() error
+	nativeSync           func() error
+	capacityNotify       bool     // advertise CONFIG_CHANGE_MSG for dynamic slots
+	frontendReq          *os.File // guarded by mu
+	socketPath           string
+	backend              Backend
+	logf                 func(format string, args ...any)
+	stats                *Stats
+	ctx                  context.Context
+	onReadFatal          func(error)
+	discardSupported     bool // fixed at device construction, including pooled devices
 
 	// unified-memfd invariant (docs/vmm.md#patch-0001): SET_MEM_TABLE must arrive with
 	// fds whose inode matches memfdInode; mmapBytes are sub-slices of
@@ -304,6 +306,12 @@ func (s *Server) Listen() error {
 // Serve returns nil on Stop() or context cancel. Returns error only on
 // fatal accept failures (other than the close-driven case).
 func (s *Server) Serve(ctx context.Context) error {
+	if s.nativeSync != nil {
+		if s.listener == nil {
+			return fmt.Errorf("native export: Listen not called")
+		}
+		return s.serveNative(ctx)
+	}
 	if s.listener == nil {
 		return fmt.Errorf("vhost: Listen not called")
 	}
@@ -1030,12 +1038,17 @@ func (s *Server) SetSlotOrigin(path string, size int64) {
 func (s *Server) CanNotifyCapacity() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.frontendReq != nil
+	return s.nativeCapacityNotify != nil || s.frontendReq != nil
 }
 
 // NotifyCapacity requests a new GET_CONFIG followed by a guest configuration
 // interrupt if the VMM has installed a reverse request fd.
+func (s *Server) SetNativeCapacityNotify(notify func() error) { s.nativeCapacityNotify = notify }
+
 func (s *Server) NotifyCapacity() error {
+	if s.nativeCapacityNotify != nil {
+		return s.nativeCapacityNotify()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.frontendReq == nil {
@@ -1051,3 +1064,7 @@ func (s *Server) NotifyCapacity() error {
 	}
 	return err
 }
+
+// SetBeforeWrite binds snapshot protection. Caller must hold backend quiescence
+// when changing the hook after serving has begun.
+func (s *Server) SetBeforeWrite(before func(uint64, uint64) error) { s.memTable.BeforeWrite = before }

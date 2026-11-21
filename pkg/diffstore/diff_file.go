@@ -67,6 +67,7 @@ type DiskOption interface {
 }
 
 type diskOptions struct {
+	durableFlush   bool
 	encryption     *diffEncryption
 	required       bool
 	encryptionSet  bool

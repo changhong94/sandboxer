@@ -153,10 +153,10 @@ func (s *FileSink) commitAlias(ctx context.Context, role, path string) error {
 // extents flow (holes ride the envelope map); the artifact file itself is dense
 // and survives non-sparse-aware copies and filesystems.
 //
-// The artifact is not fsynced, nor is the output directory: capture defines
-// logical completion, not stable-storage durability. Physical writeback is
-// delegated to the filesystem and underlying storage implementation.
-// See #184.
+// Content is synced before rename, then the destination directory is synced.
+// Alias publication also syncs the directory chain. Live capture performs these
+// barriers after the parent resumes; successful completion must not merely mean
+// dirty page-cache data exists.
 func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.Source) (string, string, string, error) {
 	if err := validateArtifactAliasID(s.sandboxID); err != nil {
 		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
@@ -186,15 +186,20 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	if s.codec != nil {
 		options = append(options, tarstream.WithCodec(s.codec, s.required))
 	}
+	packStart := time.Now()
 	scheme, digest, err := tarstream.WriteTo(ctx, f, kind, src, options...)
+	s.logf("artifact phase: kind=%s stage=pack duration=%s", kind, time.Since(packStart))
 	if err != nil {
 		_ = f.Close()
 		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
 	}
 	info, statErr := f.Stat()
+	syncStart := time.Now()
+	syncErr := f.Sync()
+	s.logf("artifact phase: kind=%s stage=sync duration=%s", kind, time.Since(syncStart))
 	closeErr := f.Close()
-	if statErr != nil || closeErr != nil {
-		return "", "", "", errors.Join(statErr, closeErr)
+	if statErr != nil || syncErr != nil || closeErr != nil {
+		return "", "", "", errors.Join(statErr, syncErr, closeErr)
 	}
 	if kind == "snapshot" {
 		s.logf("snapshot memory carrier: physical_bytes=%d identity=%s:%s", info.Size(), scheme, digest)
@@ -208,12 +213,21 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		if validateErr := validateArtifactFile(ctx, final, kind, src.Size(), s.codec, s.codec != nil, scheme, digest); validateErr != nil {
 			return "", "", "", fmt.Errorf("reuse existing %s: %w", kind, validateErr)
 		}
+		if err := syncLocalPath(final, false); err != nil {
+			return "", "", "", err
+		}
+		if err := syncLocalPath(s.outDir, true); err != nil {
+			return "", "", "", err
+		}
 		return scheme, digest, final, nil
 	}
 	if err != nil {
 		return "", "", "", fmt.Errorf("commit %s without replacement: %w", kind, err)
 	}
 	keepTmp = true // rename consumed the path; deferred cleanup has nothing to remove
+	if err := syncLocalPath(s.outDir, true); err != nil {
+		return "", "", "", err
+	}
 	return scheme, digest, final, nil
 }
 
@@ -577,6 +591,9 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, basena
 	if err := s.writer.Finalize(root); err != nil {
 		return err
 	}
+	if err := s.file.Sync(); err != nil {
+		return fmt.Errorf("sync snapshot Bundle: %w", err)
+	}
 	if err := s.file.Close(); err != nil {
 		return fmt.Errorf("close snapshot Bundle: %w", err)
 	}
@@ -594,6 +611,12 @@ func (s *BundleSink) finalize(ctx context.Context, root store.ContentKey, basena
 		return fmt.Errorf("commit snapshot Bundle without replacement: %w", err)
 	}
 	s.tmpPath = ""
+	if err := syncLocalPath(final, false); err != nil {
+		return err
+	}
+	if err := SyncLocalDirectory(ctx, s.outDir); err != nil {
+		return err
+	}
 	if role != "" {
 		if err := commitArtifactAlias(ctx, s.outDir, s.sandboxID, role, final); err != nil {
 			return fmt.Errorf("commit %s Bundle alias: %w", role, err)
@@ -709,9 +732,10 @@ func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactP
 	}
 	artifact := os.NewFile(uintptr(fd), artifactAbs)
 	info, statErr := artifact.Stat()
+	syncErr := artifact.Sync()
 	closeErr := artifact.Close()
-	if statErr != nil || closeErr != nil {
-		return fmt.Errorf("commit %s alias artifact: %w", role, errors.Join(statErr, closeErr))
+	if statErr != nil || syncErr != nil || closeErr != nil {
+		return fmt.Errorf("commit %s alias artifact: %w", role, errors.Join(statErr, syncErr, closeErr))
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("commit %s alias artifact is not a regular file", role)
@@ -741,7 +765,7 @@ func commitArtifactAlias(ctx context.Context, outDir, sandboxID, role, artifactP
 		return fmt.Errorf("commit %s alias: %w", role, err)
 	}
 	temporaryOpen = false
-	return nil
+	return SyncLocalDirectory(ctx, outAbs)
 }
 
 func createAliasSymlink(outDir, sandboxID, role, target string) (string, error) {

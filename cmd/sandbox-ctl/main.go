@@ -48,6 +48,10 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "fork":
+		os.Exit(forkCmd(os.Args[2:]))
+	case "prepare-run":
+		os.Exit(prepareRunCmd(os.Args[2:]))
 	case "run":
 		os.Exit(runCmd(os.Args[2:]))
 	case "disk":
@@ -138,6 +142,12 @@ Usage:
                         [--mode local|bundle] [--manifest-config <path>]
                         [--ref-location name=file:///absolute/path ...]
                         [--timeout <sec>]
+  sandbox-ctl fork --parent-id <parent> --sandbox-id <child> --config <child.yaml>
+                   --run-root <dir> --base-root <dir> (--output <snapshot-dir> | --upload)
+                   [--manifest-config <path>]
+                   [--ch-binary <path>] [--ready-fd <fd>]
+                   native snapshot-backed fork; child remains foreground-owned
+
   sandbox-ctl snapshot  [--sandbox-id <sid>] [--path-id <leaf>]
                         (--output <out_dir> | --upload | --checkpoint <ID>)
                         [--mode local|bundle] [--resume]

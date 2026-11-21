@@ -76,7 +76,9 @@ ch-build:
 	STAGE=build $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
 cloud-hypervisor: $(CLOUD_HYPERVISOR_BIN)
 	$(call link_bin,cloud-hypervisor)
-$(CLOUD_HYPERVISOR_BIN):
+.PHONY: ch-check-inputs
+ch-check-inputs:
+$(CLOUD_HYPERVISOR_BIN): ch-check-inputs
 	STAGE=fetch $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
 	STAGE=patches-apply $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh
 	STAGE=build $(CH_INVOKE) bash deps/build-cloud-hypervisor.sh

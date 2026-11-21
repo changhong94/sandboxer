@@ -66,11 +66,11 @@ func LoadMergedWithPresence(paths []string) (*SandboxConfig, FieldPresence, erro
 		if err != nil {
 			return nil, FieldPresence{}, fmt.Errorf("sandbox: read %s: %w", path, err)
 		}
-		presence, err := inspectPresence(raw)
+		document, presence, err := inspectConfigDocument(raw)
 		if err != nil {
 			return nil, FieldPresence{}, fmt.Errorf("sandbox: parse %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		if err := document.Decode(&cfg); err != nil {
 			return nil, FieldPresence{}, fmt.Errorf("sandbox: parse %s: %w", path, err)
 		}
 		combined.merge(presence)
@@ -83,12 +83,12 @@ func LoadMergedWithPresence(paths []string) (*SandboxConfig, FieldPresence, erro
 }
 
 func LoadConfigBytesWithPresence(raw []byte) (*SandboxConfig, FieldPresence, error) {
-	presence, err := inspectPresence(raw)
+	document, presence, err := inspectConfigDocument(raw)
 	if err != nil {
 		return nil, FieldPresence{}, fmt.Errorf("sandbox: parse config bytes: %w", err)
 	}
 	var cfg SandboxConfig
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	if err := document.Decode(&cfg); err != nil {
 		return nil, FieldPresence{}, fmt.Errorf("sandbox: parse config bytes: %w", err)
 	}
 	if err := ValidateMountPaths(cfg.Mounts); err != nil {
@@ -99,23 +99,31 @@ func LoadConfigBytesWithPresence(raw []byte) (*SandboxConfig, FieldPresence, err
 }
 
 func inspectPresence(raw []byte) (FieldPresence, error) {
+	_, presence, err := inspectConfigDocument(raw)
+	return presence, err
+}
+
+// Parse once: presence validation and typed decoding must describe the same
+// document. Node.Decode still invokes all custom validators and rejects
+// duplicate keys; multi-document and mapping checks remain below.
+func inspectConfigDocument(raw []byte) (*yaml.Node, FieldPresence, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	var document yaml.Node
 	if err := decoder.Decode(&document); err != nil {
-		return FieldPresence{}, err
+		return nil, FieldPresence{}, err
 	}
 	if len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
-		return FieldPresence{}, errors.New("sandbox config must be one mapping document")
+		return nil, FieldPresence{}, errors.New("sandbox config must be one mapping document")
 	}
 	var extra yaml.Node
 	if err := decoder.Decode(&extra); err != nil && !errors.Is(err, io.EOF) {
-		return FieldPresence{}, err
+		return nil, FieldPresence{}, err
 	} else if err == nil {
-		return FieldPresence{}, errors.New("sandbox config contains multiple YAML documents")
+		return nil, FieldPresence{}, errors.New("sandbox config contains multiple YAML documents")
 	}
 	var presence FieldPresence
 	collectPresence(document.Content[0], "", &presence)
-	return presence, nil
+	return &document, presence, nil
 }
 
 func collectPresence(node *yaml.Node, prefix string, presence *FieldPresence) {

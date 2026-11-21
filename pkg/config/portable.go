@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -579,35 +580,105 @@ func yamlPath(path string) string {
 	return path
 }
 
+// ParseCanonicalPortableSandboxConfig performs strict schema and layout checks
+// once, then checks canonical encoding against those exact validated bytes.
+func ParseCanonicalPortableSandboxConfig(raw []byte, checkpoint bool) (*PortableSandboxConfig, error) {
+	parse := ParsePortableSandboxConfig
+	if checkpoint {
+		parse = ParseCheckpointSandboxConfig
+	}
+	cfg, err := parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(raw, canonical) {
+		return nil, errors.New("portable config is not canonically encoded")
+	}
+	return cfg, nil
+}
+
 // MarshalPortableSandboxConfig returns the sole canonical encoding. Parsing
 // the result is part of the operation, guarding accidental renderer/schema
 // drift.
 func MarshalPortableSandboxConfig(cfg *PortableSandboxConfig) ([]byte, error) {
+	raw, _, err := marshalAndParsePortable(cfg)
+	return raw, err
+}
+
+// Reuse the parser result instead of discarding it and parsing the same bytes
+// again for Clone. Canonical encoding, size limits and strict schema checks are
+// exactly the same for serialization and deep cloning.
+func marshalAndParsePortable(cfg *PortableSandboxConfig) ([]byte, *PortableSandboxConfig, error) {
 	if cfg == nil {
-		return nil, errors.New("portable config: nil value")
+		return nil, nil, errors.New("portable config: nil value")
 	}
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	raw, err := yaml.Marshal(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("marshal portable config: %w", err)
+		return nil, nil, fmt.Errorf("marshal portable config: %w", err)
+	}
+	if len(raw) > MaxPortableConfigBytes {
+		return nil, nil, fmt.Errorf("portable config exceeds %d bytes", MaxPortableConfigBytes)
+	}
+	cloned, err := parsePortableSandboxConfig(raw, cfg.checkpointLayout)
+	if err != nil {
+		return nil, nil, fmt.Errorf("validate canonical portable config: %w", err)
+	}
+	return raw, cloned, nil
+}
+func (p *PortableSandboxConfig) Clone() (*PortableSandboxConfig, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	if err := validateCloneScalars(reflect.ValueOf(p)); err != nil {
+		return nil, err
+	}
+	// Keep the serialized size bound. The input is already a typed value;
+	// cloning it need not parse YAML again. External bytes still use the strict
+	// parser, and publication still verifies the canonical renderer/schema.
+	raw, err := yaml.Marshal(p)
+	if err != nil {
+		return nil, err
 	}
 	if len(raw) > MaxPortableConfigBytes {
 		return nil, fmt.Errorf("portable config exceeds %d bytes", MaxPortableConfigBytes)
 	}
-	if _, err := parsePortableSandboxConfig(raw, cfg.checkpointLayout); err != nil {
-		return nil, fmt.Errorf("validate canonical portable config: %w", err)
+	out := *p
+	out.Resources.Allocatable = cloneAllocatable(p.Resources.Allocatable)
+	out.Boot.Root = clonePortableRoot(p.Boot.Root)
+	if p.Boot.DiskCapabilities != nil {
+		v := *p.Boot.DiskCapabilities
+		out.Boot.DiskCapabilities = &v
 	}
-	return raw, nil
-}
-
-func (p *PortableSandboxConfig) Clone() (*PortableSandboxConfig, error) {
-	raw, err := MarshalPortableSandboxConfig(p)
-	if err != nil {
-		return nil, err
+	out.Boot.Disks = append([]PortableDiskConfig(nil), p.Boot.Disks...)
+	for i := range out.Boot.Disks {
+		d := &out.Boot.Disks[i]
+		d.PortableRootConfig = clonePortableRoot(d.PortableRootConfig)
+		if d.Slot != nil {
+			v := *d.Slot
+			if v.Size != nil {
+				size := *v.Size
+				v.Size = &size
+			}
+			d.Slot = &v
+		}
+		if d.Binding != nil {
+			v := *d.Binding
+			d.Binding = &v
+		}
 	}
-	return parsePortableSandboxConfig(raw, p.checkpointLayout)
+	out.Launch.Args = append([]string(nil), p.Launch.Args...)
+	out.Launch.Env = cloneMap(p.Launch.Env)
+	out.Launch.Plugin = clonePlugins(p.Launch.Plugin)
+	out.Mounts, out.Files = cloneMounts(p.Mounts), cloneFiles(p.Files)
+	out.Init, out.Metadata = cloneInit(p.Init), cloneMap(p.Metadata)
+	return &out, nil
 }
 
 func (p *PortableSandboxConfig) Validate() error {
@@ -1111,4 +1182,56 @@ func (p *PortableSandboxConfig) ValidateCapturedDiskCapabilities() error {
 		return errors.New("snapshot lacks captured disk capabilities for its topology")
 	}
 	return required.CheckGuest(actual.SlotV1, actual.ProjectionV1)
+}
+
+func clonePortableRoot(in PortableRootConfig) PortableRootConfig {
+	out := in
+	out.BaseFromRefs = append([]string(nil), in.BaseFromRefs...)
+	if in.Overlay != nil {
+		v := *in.Overlay
+		v.BaseFromRefs = append([]string(nil), v.BaseFromRefs...)
+		out.Overlay = &v
+	}
+	return out
+}
+
+// Preserve scalar and mapping-key restrictions of validateStrictYAMLNode for
+// typed callers, including values not normally supplied by a parsed artifact.
+func validateCloneScalars(v reflect.Value) error {
+	switch v.Kind() {
+	case reflect.String:
+		if v.Len() > MaxPortableScalarBytes {
+			return fmt.Errorf("portable scalar exceeds %d bytes", MaxPortableScalarBytes)
+		}
+	case reflect.Pointer:
+		if !v.IsNil() {
+			return validateCloneScalars(v.Elem())
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if err := validateCloneScalars(v.Field(i)); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			if err := validateCloneScalars(v.Index(i)); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		it := v.MapRange()
+		for it.Next() {
+			if it.Key().Kind() == reflect.String && it.Key().String() == "<<" {
+				return errors.New("portable YAML merge keys are not allowed")
+			}
+			if err := validateCloneScalars(it.Key()); err != nil {
+				return err
+			}
+			if err := validateCloneScalars(it.Value()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

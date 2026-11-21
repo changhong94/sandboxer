@@ -95,8 +95,11 @@ func (c *SnapshotCfg) ArtifactRefs() []string {
 
 // SnapshotCfgReadOptions supplies trusted local ref resolution inputs.
 type SnapshotCfgReadOptions struct {
-	RefLocations config.RefLocations
-	RelativeDir  string
+	// PrepareSandboxRef resolves trusted named locations after S has been
+	// authenticated, before opening its selected E. It must not skip E verification.
+	PrepareSandboxRef func(string) error
+	RefLocations      config.RefLocations
+	RelativeDir       string
 }
 
 // SnapshotCfgDocument carries the derived compatibility projection and the
@@ -148,6 +151,11 @@ func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts Snaps
 	opened, root, memoryCfg, err := r.openSnapshot(ctx, rootRef, opts)
 	if err != nil {
 		return nil, err
+	}
+	if opts.PrepareSandboxRef != nil {
+		if err := opts.PrepareSandboxRef(memoryCfg.SandboxRef); err != nil {
+			return nil, errors.Join(fmt.Errorf("snapshot.cfg sandbox_ref location: %w", err), root.Close())
+		}
 	}
 	sandboxSource, err := openReferencedSandbox(ctx, memoryCfg.SandboxRef, opened.opts)
 	if err != nil {

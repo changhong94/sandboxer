@@ -858,6 +858,11 @@ Backend metadata work remains serialized inside the Store, so unrelated cache
 misses can still wait. A cached ACK does not promise immediately reusable host
 space.
 
+On this migration branch, checkpoint-enabled runtime disks explicitly select
+`WithDurableFlush`: FLUSH drains accepted writes and fsyncs the backing store;
+checkpoint registration also syncs before returning. The following upstream
+ephemeral policy applies only when this option is not selected.
+
 A healthy, valid guest **FLUSH is a no-op**. It neither initiates writeback,
 waits for dirty pages nor invokes Drain, fsync or fdatasync. Request ordering and
 fatal-state checks remain. Existing wire features are retained for Cloud

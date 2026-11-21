@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -16,7 +18,13 @@ import (
 // prepareRestoreCheckpoint pins the complete source set before acquiring the
 // target directory. The full release is registered before disk closers by Run;
 // source pins are also released as soon as the target disks no longer need them.
-func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedSandboxSource) (_ Options, _ *openedSandboxSource, release func() error, retErr error) {
+func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedSandboxSource, nativeBranch ...bool) (_ Options, _ *openedSandboxSource, release func() error, retErr error) {
+	started := time.Now()
+	stage := func(name string) {
+		if len(nativeBranch) != 0 && nativeBranch[0] {
+			log.Printf("[inherited checkpoint] phase=%s elapsed=%s", name, time.Since(started))
+		}
+	}
 	var closes []func() error
 	release = func() error {
 		var err error
@@ -34,6 +42,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 	if err != nil {
 		return opts, source, release, err
 	}
+	stage("storage_open")
 	closes = append(closes, storage.Close)
 	var pins *artifact.PinnedDiffCheckpoints
 	if source.Root.Checkpoint != nil {
@@ -44,6 +53,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 		if err != nil {
 			return opts, source, release, err
 		}
+		stage("sources_pinned")
 		closes = append(closes, pins.Close)
 	}
 	directory := filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint")
@@ -53,6 +63,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 			return opts, source, release, err
 		}
 		closes = append(closes, owner.Close)
+		stage("target_locked")
 		opts.checkpointOwner = owner
 	}
 	if pins == nil {
@@ -63,6 +74,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 		if err != nil {
 			return opts, source, release, err
 		}
+		stage("reopen_checked")
 		if len(ids) != 0 {
 			opts.checkpointReopen = ids
 			opts.checkpointReleaseSources = pins.Close
@@ -80,10 +92,15 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 		return opts, source, release, err
 	}
 	closes = append(closes, func() error { return os.RemoveAll(materialDir) })
-	result, err := storage.MaterializePinnedCheckpoint(ctx, source.SelectedRef, opts.RefLocations, materialDir, pins)
+	materialize := storage.MaterializePinnedCheckpoint
+	if len(nativeBranch) != 0 && nativeBranch[0] {
+		materialize = storage.BranchPinnedCheckpoint
+	}
+	result, err := materialize(ctx, source.SelectedRef, opts.RefLocations, materialDir, pins)
 	if err != nil {
 		return opts, source, release, fmt.Errorf("restore: materialize Checkpoint: %w", err)
 	}
+	stage("branch_materialized")
 	// MaterializePinnedCheckpoint includes Publisher.Close: all source reads
 	// have finished and its output is independent. Keep the output directory,
 	// readers, storage and target owner alive until the dependent disks close.
@@ -99,6 +116,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 	if err != nil {
 		return opts, source, release, err
 	}
+	stage("branch_reopened")
 	closes = append(closes, materialized.Root.Close)
 	return opts, materialized, release, nil
 }

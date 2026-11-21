@@ -25,6 +25,7 @@
 package ctl
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -37,6 +38,11 @@ import (
 // Request is a control request on ctl.sock. Type selects which fields
 // are populated.
 type Request struct {
+	NativeForkHandoff *ForkDiskHandoff `json:"native_fork_handoff,omitempty"`
+	// ForkDiskHandoff is an in-process host capability, never a wire field.
+	// It receives the durable disk root while source vCPUs remain paused.
+	ForkDiskHandoff func(context.Context, string, string) error `json:"-"`
+
 	BodyBytes       int                 `json:"body_bytes,omitempty"`
 	UsageHistory    bool                `json:"usage_history,omitempty"`
 	UsageCursor     int64               `json:"usage_cursor,omitempty,string"`
@@ -53,9 +59,12 @@ type Request struct {
 	Upload bool   `json:"upload,omitempty"`
 	// Mode is optional for wire compatibility. Empty means local tarstream;
 	// bundle selects one multi-Manifest ZIP Bundle.
-	Mode        string `json:"mode,omitempty"`
-	ResumeAfter bool   `json:"resume_after,omitempty"`
-	StagingDir  string `json:"staging_dir,omitempty"`
+	Mode         string `json:"mode,omitempty"`
+	ResumeAfter  bool   `json:"resume_after,omitempty"`
+	NotifyResume bool   `json:"notify_resume,omitempty"`
+	// OnResume is installed by the trusted control server, never by JSON.
+	OnResume   func() `json:"-"`
+	StagingDir string `json:"staging_dir,omitempty"`
 	// nil means that guest caches are preserved; callers can explicitly opt in
 	// to cache dropping with a true value.
 	DropCaches *bool `json:"drop_caches,omitempty"`
@@ -80,8 +89,10 @@ type Response struct {
 	CheckpointCount int                 `json:"checkpoint_count,omitempty"`
 
 	// snapshot_done fields.
-	MemorySize          uint64                 `json:"memory_size,omitempty"`
-	MemoryResident      uint64                 `json:"memory_resident,omitempty"`
+	MemorySize     uint64 `json:"memory_size,omitempty"`
+	MemoryResident uint64 `json:"memory_resident,omitempty"`
+	// GuestPauseMS spans the quiesce request through successful guest ACK/MUX reattach.
+	GuestPauseMS        *float64               `json:"guest_pause_ms,omitempty"`
 	WallclockPauseMs    int64                  `json:"wallclock_pause_ms,omitempty"`
 	WallclockDumpMs     int64                  `json:"wallclock_dump_ms,omitempty"`
 	SnapshotManifestKey string                 `json:"snapshot_manifest_key,omitempty"`
@@ -143,6 +154,7 @@ func (r Request) SnapshotMode() (string, error) {
 const (
 	TypeSnapshotRequest       = "snapshot_request"
 	TypeSnapshotDone          = "snapshot_done"
+	TypeSnapshotResumed       = "snapshot_resumed"
 	TypeExportRequest         = "export_request"
 	TypeExportDone            = "export_done"
 	TypeExecRequest           = "exec_request"

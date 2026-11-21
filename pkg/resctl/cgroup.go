@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -51,6 +52,8 @@ import (
 // CPUWeight is clamp(round(allocatable.cpu * 100), 1, 10000); see
 // docs/resources.md#cpu-enforcement.
 type CgroupConfig struct {
+	// ReuseLimits reads back prepared limits before avoiding redundant kernel writes.
+	ReuseLimits     bool
 	Path            string
 	FD              int
 	MemoryMaxBytes  uint64
@@ -118,30 +121,34 @@ func SetupCgroup(cfg CgroupConfig) (*CgroupController, error) {
 	}
 	stablePath := fmt.Sprintf("/proc/self/fd/%d", target.Fd())
 
-	if err := writeCgFile(stablePath, "memory.max", strconv.FormatUint(cfg.MemoryMaxBytes, 10)); err != nil {
+	writeLimit := writeCgFile
+	if cfg.ReuseLimits {
+		writeLimit = writeCgFileUnlessEqual
+	}
+	if err := writeLimit(stablePath, "memory.max", strconv.FormatUint(cfg.MemoryMaxBytes, 10)); err != nil {
 		return fail(fmt.Errorf("cgroup: memory.max: %w", err))
 	}
 	memoryHigh := "max"
 	if cfg.MemoryHighBytes > 0 {
 		memoryHigh = strconv.FormatUint(cfg.MemoryHighBytes, 10)
 	}
-	if err := writeCgFile(stablePath, "memory.high", memoryHigh); err != nil {
+	if err := writeLimit(stablePath, "memory.high", memoryHigh); err != nil {
 		return fail(fmt.Errorf("cgroup: memory.high: %w", err))
 	}
 	// Disable swap so cgroup OOM signals are unambiguous. swap.max may
 	// be unavailable on hosts compiled without the swap controller; that
 	// is acceptable — we want zero swap and absence of the file means
 	// effectively zero anyway.
-	if err := writeCgFile(stablePath, "memory.swap.max", "0"); err != nil {
+	if err := writeLimit(stablePath, "memory.swap.max", "0"); err != nil {
 		log.Printf("[sandbox-ctl] cgroup: memory.swap.max write skipped: %v", err)
 	}
 
 	const period = 100000
-	if err := writeCgFile(stablePath, "cpu.max", fmt.Sprintf("%d %d", cfg.CPUMaxQuotaUs, period)); err != nil {
+	if err := writeLimit(stablePath, "cpu.max", fmt.Sprintf("%d %d", cfg.CPUMaxQuotaUs, period)); err != nil {
 		return fail(fmt.Errorf("cgroup: cpu.max: %w", err))
 	}
 	if cfg.CPUWeight > 0 {
-		if err := writeCgFile(stablePath, "cpu.weight", strconv.FormatUint(cfg.CPUWeight, 10)); err != nil {
+		if err := writeLimit(stablePath, "cpu.weight", strconv.FormatUint(cfg.CPUWeight, 10)); err != nil {
 			return fail(fmt.Errorf("cgroup: cpu.weight: %w", err))
 		}
 	}
@@ -180,6 +187,26 @@ func (c *CgroupController) ConfigureSysProcAttr(attr *syscall.SysProcAttr) error
 	attr.UseCgroupFD = true
 	attr.CgroupFD = int(c.target.Fd())
 	return nil
+}
+
+func writeCgFileUnlessEqual(dir, name, value string) error {
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err == nil && strings.TrimSpace(string(raw)) == value {
+		return nil
+	}
+	return writeCgFile(dir, name, value)
+}
+
+// SetupPreparedCgroupForConfig still checks the actual pinned cgroup values;
+// it only omits writes whose limits already match preparation exactly.
+func SetupPreparedCgroupForConfig(cfg *config.SandboxConfig) (*CgroupController, error) {
+	c, err := BuildCgroupConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	c.MemoryHighBytes = 0
+	c.ReuseLimits = true
+	return SetupCgroup(c)
 }
 
 func writeCgFile(dir, name, value string) error {

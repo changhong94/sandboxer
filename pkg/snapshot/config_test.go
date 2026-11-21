@@ -52,3 +52,19 @@ func TestSnapshotConfigRejectsNonPortableAndDuplicateRefs(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCanonicalConfigRejectsAlternateEncoding(t *testing.T) {
+	cfg := &Config{Version: 1, SandboxRef: "manifest://" + snapshotConfigTestKey}
+	raw, err := MarshalConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCanonicalConfig(raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range [][]byte{append([]byte("# alternative encoding\n"), raw...), append(append([]byte{}, raw...), []byte("unknown: true\n")...)} {
+		if _, err := ParseCanonicalConfig(invalid); err == nil {
+			t.Fatal("accepted noncanonical or invalid configuration")
+		}
+	}
+}

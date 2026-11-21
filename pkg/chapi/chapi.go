@@ -73,7 +73,15 @@ func (c Client) do(method, path, body string) error {
 	return c.doContext(context.Background(), method, path, body)
 }
 
+// ResumeSubmittedContext signals after the complete resume request is written,
+// before waiting for its response. The caller must still check the final error.
+func (c Client) ResumeSubmittedContext(ctx context.Context, submitted func()) error {
+	return c.doContextSubmitted(ctx, "PUT", "/api/v1/vm.resume", "", submitted)
+}
 func (c Client) doContext(ctx context.Context, method, path, body string) error {
+	return c.doContextSubmitted(ctx, method, path, body, nil)
+}
+func (c Client) doContextSubmitted(ctx context.Context, method, path, body string, submitted func()) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -103,6 +111,9 @@ func (c Client) doContext(ctx context.Context, method, path, body string) error 
 			return fmt.Errorf("ch api %s %s write: %w", method, path, ctxErr)
 		}
 		return fmt.Errorf("ch api %s %s write: %w", method, path, err)
+	}
+	if submitted != nil {
+		submitted()
 	}
 	buf := make([]byte, 4096)
 	n, readErr := conn.Read(buf)
@@ -256,7 +267,7 @@ func probePaused(ctx context.Context, conn net.Conn, end time.Time) (ready, pend
 	if wire.N == 0 || len(body) > maxReadyResponseBody {
 		return false, false, fmt.Errorf("vm.info response exceeds %d bytes", maxReadyResponseBody)
 	}
-	if resp.StatusCode == http.StatusInternalServerError && isVMNotCreated(body) {
+	if (resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusNotFound) && isVMNotCreated(body) {
 		return false, true, fmt.Errorf("VM is not created")
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -307,4 +318,23 @@ func requireJSONEOF(dec *json.Decoder) error {
 		return err
 	}
 	return nil
+}
+
+// CaptureProtect inhibits physical balloon discard during before-image capture.
+// Enabling requires paused CH; disabling follows reader/protection teardown.
+func (c Client) CaptureProtect(enabled bool) error {
+	body := "false"
+	if enabled {
+		body = "true"
+	}
+	return c.do("PUT", "/api/v1/vm.capture-protect", body)
+}
+
+// ResizeDisk publishes the already committed native backend geometry to virtio.
+func (c Client) ResizeDisk(ctx context.Context, id string, size uint64) error {
+	body, err := json.Marshal(map[string]any{"id": id, "desired_size": size})
+	if err != nil {
+		return err
+	}
+	return c.doContext(ctx, "PUT", "/api/v1/vm.resize-disk", string(body))
 }

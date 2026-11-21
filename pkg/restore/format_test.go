@@ -150,6 +150,15 @@ func TestOpenMemoryParentLayersValidatesCapacityBeforeUse(t *testing.T) {
 }
 
 func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
+	testSeparateSandboxScope(t, false)
+}
+func TestSpeculativeSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
+	testSeparateSandboxScope(t, true)
+}
+func TestPipelinedSourcesRetainAuthenticatedScopes(t *testing.T) {
+	testSeparateSandboxScope(t, false, true)
+}
+func testSeparateSandboxScope(t *testing.T, speculative bool, pipeline ...bool) {
 	const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -271,7 +280,47 @@ func TestSeparateSandboxBundleRetainsSnapshotBundleMemoryScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.stream.Close()
-	sandboxSource, err := openReferencedSandbox(ctx, eBundleRef, root.opts)
+	var sandboxSource *openedSandboxSource
+	if len(pipeline) > 0 && pipeline[0] {
+		opts := Options{storage: storage, SnapshotPath: sPath, SnapshotRef: "file://" + filepath.Base(sPath) + "@manifest:" + manifest.HexKey(sKey), ManifestCfg: manifestCfg, CustomerKeyFn: keyFn}
+		prepared, e := PrepareSources(ctx, opts)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer prepared.Close()
+		changed := opts
+		changed.SnapshotRef += "0"
+		if used, e := prepared.take(changed); used || e != nil {
+			t.Fatal("different source accepted", e)
+		}
+		changed = opts
+		changed.CustomerKeyFn = func() ([32]byte, error) { return [32]byte{9}, nil }
+		if used, e := prepared.take(changed); used || e != nil {
+			t.Fatal("different tenant key accepted", e)
+		}
+		changed = opts
+		changed.RefLocations = config.RefLocations{"different": "file:///different"}
+		if used, e := prepared.take(changed); used || e != nil {
+			t.Fatal("different locations accepted", e)
+		}
+		if used, e := prepared.take(opts); !used || e != nil {
+			t.Fatal("valid prepared source not consumed", e)
+		}
+		if _, e := prepared.take(opts); e == nil {
+			t.Fatal("prepared source reused")
+		}
+		defer prepared.snapshot.Close()
+		sandboxSource = prepared.sandbox
+	} else if speculative {
+		hint := startSandboxSourceHint(ctx, Options{PreparedRestore: &sandbox.PreparedRestore{}, SandboxRefHint: eBundleRef, SnapshotPath: sPath, storage: storage, ManifestCfg: manifestCfg, CustomerKeyFn: keyFn})
+		if hint == nil {
+			t.Fatal("local source hint not scheduled")
+		}
+		defer hint.close()
+		sandboxSource, err = hint.take(ctx, eBundleRef, root.opts)
+	} else {
+		sandboxSource, err = openReferencedSandbox(ctx, eBundleRef, root.opts)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ func snapshotCmd(args []string) int {
 	outDir := fs.String("output", "", "local output dir; produces <sid>.snapshot + scheme-qualified content-addressed artifacts")
 	upload := fs.Bool("upload", false, "ingest Snapshot S, Sandbox E, and dependencies into the manifest store; stdout = S manifest key")
 	mode := fs.String("mode", ctl.SnapshotModeLocal, "local snapshot format: local|bundle (default local)")
+	progress := fs.Bool("progress", false, "emit resumed progress before the final JSON result; requires --json --resume")
 	resume := fs.Bool("resume", false, "keep sandbox running after snapshot (default: destroy via /vm.shutdown)")
 	dropCaches := fs.Bool("drop-caches", false, "drop guest page, inode, and dentry caches before snapshot (default: preserve guest caches)")
 	mergeRef := fs.Bool("merge-ref", true, "merge a local parent memory ref into the new memory self layer")
@@ -35,6 +37,10 @@ func snapshotCmd(args []string) int {
 	timeoutS := fs.Int("timeout", 0, "seconds to wait for snapshot_done (0 = wait indefinitely; upload can take minutes)")
 
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *progress && (!*jsonOutput || !*resume) {
+		fmt.Fprintln(os.Stderr, "snapshot: --progress requires --json --resume")
 		return 2
 	}
 	if fs.NArg() != 0 {
@@ -117,12 +123,13 @@ func snapshotCmd(args []string) int {
 	}
 
 	req := ctl.Request{
-		Type:        ctl.TypeSnapshotRequest,
-		OutDir:      *outDir,
-		Upload:      *upload,
-		ResumeAfter: *resume,
-		DropCaches:  dropCaches,
-		MergeRef:    mergeRef,
+		Type:         ctl.TypeSnapshotRequest,
+		OutDir:       *outDir,
+		Upload:       *upload,
+		ResumeAfter:  *resume,
+		NotifyResume: *progress,
+		DropCaches:   dropCaches,
+		MergeRef:     mergeRef,
 	}
 	if *checkpoint != "" {
 		req.Type = ctl.TypeCheckpointSnapshotRequest
@@ -136,9 +143,21 @@ func snapshotCmd(args []string) int {
 		return 1
 	}
 	var resp ctl.Response
-	if err := ctl.ReadMessage(c, &resp); err != nil {
-		fmt.Fprintf(os.Stderr, "snapshot: recv response: %v\n", err)
-		return 1
+	for {
+		if err := ctl.ReadMessage(c, &resp); err != nil {
+			fmt.Fprintf(os.Stderr, "snapshot: recv response: %v\n", err)
+			return 1
+		}
+		if resp.Type != ctl.TypeSnapshotResumed {
+			break
+		}
+		if !*progress {
+			fmt.Fprintln(os.Stderr, "snapshot: unsolicited progress")
+			return 1
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+			return 1
+		}
 	}
 	if resp.Type == ctl.TypeError {
 		fmt.Fprintf(os.Stderr, "snapshot: error from sandbox: %s\n", resp.Msg)
@@ -149,6 +168,13 @@ func snapshotCmd(args []string) int {
 	}
 	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {
 		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
+	}
+	if *progress && resp.GuestPauseMS != nil {
+		// Keep the S/E publication schema unchanged. Timing is an explicit
+		// progress record and never a persistence acknowledgement.
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "snapshot_timing", "guest_pause_ms": *resp.GuestPauseMS}); err != nil {
+			return 1
+		}
 	}
 	if *jsonOutput {
 		return printCaptureJSON(resp, artifact.RoleSnapshot)

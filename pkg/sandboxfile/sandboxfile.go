@@ -151,20 +151,9 @@ func readMetadata(ctx context.Context, stream fetch.Stream) (*parsedArchive, *co
 	}
 	runtimeBytes := archive.bodies[config.SandboxRuntimeConfigName]
 	checkpointBytes, hasCheckpoint := archive.bodies[CheckpointName]
-	parseConfig := config.ParsePortableSandboxConfig
-	if hasCheckpoint {
-		parseConfig = config.ParseCheckpointSandboxConfig
-	}
-	portable, err := parseConfig(runtimeBytes)
+	portable, err := config.ParseCanonicalPortableSandboxConfig(runtimeBytes, hasCheckpoint)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("sandbox %s: %w", config.SandboxRuntimeConfigName, err)
-	}
-	canonical, err := config.MarshalPortableSandboxConfig(portable)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if !bytes.Equal(canonical, runtimeBytes) {
-		return nil, nil, nil, fmt.Errorf("sandbox %s is not canonically encoded", config.SandboxRuntimeConfigName)
 	}
 	var checkpoint *Checkpoint
 	if hasCheckpoint {
