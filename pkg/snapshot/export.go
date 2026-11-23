@@ -22,6 +22,13 @@ import (
 // memfd or CH snapshot staging fields, making calls to /vm.snapshot and memory
 // scanning structurally impossible.
 type ExportSources struct {
+	// BeforeResume runs after the durable disk commit and backend drain, with
+	// vCPUs still paused. Backends are available so a private-RAM fork can
+	// flush/reopen disks without deadlocking against Quiescer. The callback
+	// must not resume the source VM or write its disks. Errors resume the
+	// source using the ordinary failure path. This is a host-only handoff.
+	BeforeResume func(context.Context, *SandboxOutput) error
+
 	CheckpointID     string
 	checkpointState  *checkpointCapture
 	SandboxID        string
@@ -59,6 +66,9 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 			retErr = errors.Join(retErr, closeArtifactSink(sink))
 		}
 	}()
+	if sources.BeforeResume != nil && !resumeAfter {
+		return nil, errors.New("export: fork handoff requires source resume")
+	}
 	if err := validateExportSources(sources, sink); err != nil {
 		return nil, err
 	}
@@ -107,8 +117,20 @@ func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resum
 	if closeErr != nil {
 		return nil, closeErr
 	}
-	if resumeAfter {
+	if sources.BeforeResume != nil {
+		if err := checkDiskCapture(ctx, sources.Diffs); err != nil {
+			return nil, err
+		}
 		sources.Quiescer.Resume()
+		backendsResumed = true
+		if err := sources.BeforeResume(ctx, out); err != nil {
+			return nil, fmt.Errorf("export before resume: %w", err)
+		}
+	}
+	if resumeAfter {
+		if !backendsResumed {
+			sources.Quiescer.Resume()
+		}
 		backendsResumed = true
 		if err := ch.Resume(); err != nil {
 			return nil, fmt.Errorf("export CH resume: %w", err)

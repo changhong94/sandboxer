@@ -21,6 +21,9 @@ func bindCheckpointDisks(refs []SnapDiskRef, disks []DiskBackend) []SnapDiskRef 
 		}
 		id, _, _ := manager.CheckpointInfo()
 		refs[i].DiffID = id
+		refs[i].OpenCheckpoint = func(ctx context.Context, id string) (snapshot.ExportView, error) {
+			return manager.OpenCheckpoint(ctx, diffstore.CheckpointID(id))
+		}
 		refs[i].Checkpoint = func(ctx context.Context, id string) error { return manager.Checkpoint(ctx, diffstore.CheckpointID(id)) }
 		refs[i].DeleteCheckpoint = func(ctx context.Context, id string) error {
 			return manager.DeleteCheckpoint(ctx, diffstore.CheckpointID(id))

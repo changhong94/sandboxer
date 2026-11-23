@@ -232,6 +232,17 @@ func (s *Server) handle(conn *net.UnixConn) {
 			_ = WriteMessage(conn, Response{Type: TypeError, Code: code, Msg: "snapshot not supported"})
 			return
 		}
+		if req.NotifyResume && req.ResumeAfter {
+			req.OnResume = sync.OnceFunc(func() {
+				// Notification is advisory; a disconnected/slow caller cannot
+				// prevent the owner from completing durable capture.
+				_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				if err := WriteMessage(conn, Response{Type: TypeSnapshotResumed}); err != nil {
+					s.Logf("ctl.sock: resume notification: %v", err)
+				}
+				_ = conn.SetWriteDeadline(time.Time{})
+			})
+		}
 		resp, err := s.SnapshotHandler(req)
 		if err != nil {
 			// A post-commit cleanup error still owns terminal teardown.

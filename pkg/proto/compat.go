@@ -36,6 +36,8 @@ const (
 	TypePong              = abi.TypePong
 	TypeRestore           = abi.TypeRestore
 	TypeRestoreAck        = abi.TypeRestoreAck
+	TypeForkRestore       = abi.TypeForkRestore
+	TypeForkRestoreAck    = abi.TypeForkRestoreAck
 	TypeAttach            = abi.TypeAttach
 	TypeAttachAck         = abi.TypeAttachAck
 	TypeQuiesce           = abi.TypeQuiesce

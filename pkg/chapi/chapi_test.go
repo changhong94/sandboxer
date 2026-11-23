@@ -202,3 +202,49 @@ func waitFor(t *testing.T, f func() bool) {
 		t.Fatal("condition not reached")
 	}
 }
+
+func TestWaitReadyV54NotCreated404(t *testing.T) {
+	sock := unixSocket(t)
+	var calls atomic.Int32
+	stop := serveUnixHTTP(t, sock, func(conn net.Conn, req *http.Request) {
+		if calls.Add(1) == 1 {
+			writeResponse(conn, 404, notCreatedBody)
+		} else {
+			writeResponse(conn, 200, `{"state":"Paused"}`)
+		}
+	})
+	defer stop()
+	if err := WaitReady(context.Background(), sock, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() < 2 {
+		t.Fatal("accepted API before VM restore")
+	}
+}
+
+func TestFrozenForkMemoryValidatesBarrierAndBothBalloonSides(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		valid      bool
+	}{
+		{"inflating", `{"state":"Paused","memory_actual_size":12288,"config":{"memory":{"size":16384,"shared":false},"balloon":{"size":8192}}}`, true},
+		{"running", `{"state":"Running","memory_actual_size":12288,"config":{"memory":{"size":16384},"balloon":{"size":8192}}}`, false},
+		{"shared", `{"state":"Paused","memory_actual_size":16384,"config":{"memory":{"size":16384,"shared":true}}}`, false},
+		{"missing-actual", `{"state":"Paused","config":{"memory":{"size":16384}}}`, false},
+		{"oversize-target", `{"state":"Paused","memory_actual_size":16384,"config":{"memory":{"size":16384},"balloon":{"size":20480}}}`, false},
+		{"actual-without-balloon", `{"state":"Paused","memory_actual_size":12288,"config":{"memory":{"size":16384}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sock := unixSocket(t)
+			stop := serveUnixHTTP(t, sock, func(conn net.Conn, req *http.Request) { writeResponse(conn, 200, tc.body) })
+			defer stop()
+			got, err := (Client{Sock: sock, RespDeadline: time.Second}).FrozenForkMemory(context.Background())
+			if (err == nil) != tc.valid {
+				t.Fatalf("state=%+v err=%v", got, err)
+			}
+			if tc.valid && (got.Target != 8192 || got.Actual != 4096 || got.Capacity != 16384 || !got.Balloon) {
+				t.Fatalf("lost in-flight balloon state: %+v", got)
+			}
+		})
+	}
+}

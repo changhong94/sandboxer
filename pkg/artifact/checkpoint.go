@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
@@ -324,6 +325,11 @@ func (s *ProcessStorage) CheckpointVersions(ctx context.Context, c Checkpoint) (
 // opens a candidate payload. A pinned directory fd confines enumeration and
 // unlink even if an ancestor or the pathname is concurrently replaced.
 func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (retErr error) {
+	started := time.Now()
+	stage := func(name string) {
+		fmt.Fprintf(os.Stderr, "CHECKPOINT_CLEANUP stage=%s duration=%s\n", name, time.Since(started))
+		started = time.Now()
+	}
 	if s == nil {
 		return errors.New("checkpoint cleanup requires storage")
 	}
@@ -366,6 +372,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	stage("open_lock")
 	for _, keep := range retained {
 		if err := k.plan(ctx, keep); err != nil {
 			return fmt.Errorf("retained checkpoint keep plan: %w", err)
@@ -375,6 +382,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	if err := k.plan(ctx, c); err != nil {
 		return fmt.Errorf("checkpoint keep plan: %w", err)
 	}
+	stage("keep_plan")
 	// Current disks are a separate parent-owned root, even when the last
 	// ResumeSource describes an older checkpoint. Retain their local lowers
 	// and active stores until a later complete run binding replaces this set.
@@ -409,9 +417,11 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	if err != nil || physical != dir || !os.SameFile(pinned, current) {
 		return errors.New("checkpoint directory identity changed")
 	}
+	stage("validate_current")
 	if err := cleanupDiffVersionSet(ctx, dir, k.diffVersions, active); err != nil {
 		return err
 	}
+	stage("diff_cleanup")
 	for {
 		entries, err := f.ReadDir(128)
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) {
@@ -468,6 +478,7 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 			}
 		}
 		if len(entries) == 0 {
+			stage("unlink_carriers")
 			return nil
 		}
 	}

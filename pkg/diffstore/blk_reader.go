@@ -8,6 +8,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"github.com/kuasar-sandbox/sandboxer/pkg/blockexport"
 )
 
 // BlockReader is an immutable block source for disk composition and read-only
@@ -89,6 +90,12 @@ func readBlock(ctx context.Context, r BlockReader, buf []byte, offset int64) (in
 }
 
 func (r *StreamReader) Size() int64 { return r.size }
+
+// This capability is only consumed by read-only frontends. StreamReader's
+// source is immutable; mutable Disk overlays never expose it.
+func (r *StreamReader) LocalReadPlan() (*blockexport.LocalReadPlan, error) {
+	return blockexport.PlanLocalRead(r.stream, uint64(r.size))
+}
 
 func (r *StreamReader) Close() error { return r.stream.Close() }
 

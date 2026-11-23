@@ -62,9 +62,9 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	recordAtomicMax(&h.stats.inflightHWM, uint64(inflight))
 	defer h.stats.inflight.Add(-1)
 
-	// This handler only registers MISSING. Never reinterpret a different
-	// fault kind as an absent page and overwrite already present contents.
-	if ev.flags&(uffdPagefaultFlagWP|uffdPagefaultFlagMinor) != 0 {
+	// MINOR is never negotiated. WP must preserve the old resident page,
+	// never fall through to MISSING and overwrite it with a zero page.
+	if ev.flags&uffdPagefaultFlagMinor != 0 {
 		h.failRead(fmt.Errorf("uffd: unsupported pagefault flags 0x%x", ev.flags))
 		return
 	}
@@ -81,6 +81,18 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	pageVA := ev.address &^ (PageSize - 1)
 	pageOffset := memfdOffset &^ (PageSize - 1)
 	pageIdx := pageOffset / PageSize
+
+	if ev.flags&uffdPagefaultFlagWP != 0 {
+		capture := h.liveCapture.Load()
+		if capture == nil {
+			h.failRead(fmt.Errorf("uffd: write-protect fault without a capture"))
+			return
+		}
+		if err := capture.BeforeWrite(pageOffset, PageSize); err != nil {
+			h.failRead(fmt.Errorf("uffd: preserve CPU write: %w", err))
+		}
+		return
+	}
 
 	switch state := h.state.Get(pageIdx); state {
 	case StateAbsent:

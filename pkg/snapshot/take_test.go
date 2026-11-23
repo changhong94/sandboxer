@@ -302,8 +302,8 @@ func TestTakeBuildsSandboxAndMemorySnapshotAtOneFreezePoint(t *testing.T) {
 			quiescer.quiesce.Load(), quiescer.resume.Load(), quiescer.frozen.Load())
 	}
 	wantOrder := []string{
-		"ch:/api/v1/vm.pause", "disk-view", "sink:sandbox",
-		"ch:/api/v1/vm.snapshot", "sink:snapshot", "sink:commit-snapshot",
+		"ch:/api/v1/vm.pause", "ch:/api/v1/vm.snapshot", "disk-view", "sink:sandbox",
+		"sink:snapshot", "sink:commit-snapshot",
 		"sink:close", "ch:/api/v1/vm.resume",
 	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantOrder) {

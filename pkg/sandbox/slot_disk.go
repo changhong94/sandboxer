@@ -347,7 +347,7 @@ func (r *Runtime) publishDiskSlot(ctx context.Context, entry diskEntry, source c
 		return errors.New("new slot writer path already exists")
 	}
 	if plan.DiffID != "" {
-		opts = append(opts, diffstore.WithCheckpoint(plan.DiffID, plan.BaseID))
+		opts = append(opts, diffstore.WithCheckpoint(plan.DiffID, plan.BaseID), diffstore.WithDurableFlush())
 	}
 	owned := !r.spec.EnableCheckpoint
 	if owned {

@@ -2,6 +2,7 @@ package guestlink
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -390,6 +391,24 @@ func OpenMUXViaRestore(client *HostClient, epoch uint32, network *proto.NetworkS
 // OpenMUXViaRestoreContext is OpenMUXViaRestore with cancellation covering
 // both the pre-request CONNECT/OK retry window and the one-shot restore_ack.
 func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	return openMUXRestore(ctx, client, epoch, network, deadline, network != nil && network.MAC != "")
+}
+
+// OpenMUXViaForkContext requires the fork-specific guest ACK, including for
+// guests without a NIC. This prevents silently skipping identity renewal.
+func OpenMUXViaForkContext(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration) (net.Conn, proto.StdioSpec, error) {
+	return openMUXRestore(ctx, client, epoch, network, deadline, true)
+}
+
+func openMUXRestore(ctx context.Context, client *HostClient, epoch uint32, network *proto.NetworkSpec, deadline time.Duration, fork bool) (net.Conn, proto.StdioSpec, error) {
+	var seed []byte
+	if fork {
+		seed = make([]byte, 32)
+		if _, err := rand.Read(seed); err != nil {
+			return nil, proto.StdioSpec{}, err
+		}
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -402,13 +421,18 @@ func OpenMUXViaRestoreContext(ctx context.Context, client *HostClient, epoch uin
 	// WallclockNs requests a best-effort CLOCK_REALTIME adjustment because
 	// CH reloads the snapshot's stale clock. Capture after connecting, near
 	// the send; this does not bound propagation or guest scheduling delay.
+	requestType, ackType := proto.TypeRestore, proto.TypeRestoreAck
+	if fork {
+		requestType, ackType = proto.TypeForkRestore, proto.TypeForkRestoreAck
+	}
 	rawConn := conn
 	resultConn, spec, err := finishOpenMUX(rawConn, &proto.Message{
-		Type:        proto.TypeRestore,
+		Type:        requestType,
+		ForkEntropy: seed,
 		Epoch:       epoch,
 		WallclockNs: time.Now().UnixNano(),
 		Network:     network,
-	}, proto.TypeRestoreAck)
+	}, ackType)
 	if !stopCancel() {
 		_ = rawConn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {

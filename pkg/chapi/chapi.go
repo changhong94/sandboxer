@@ -256,7 +256,7 @@ func probePaused(ctx context.Context, conn net.Conn, end time.Time) (ready, pend
 	if wire.N == 0 || len(body) > maxReadyResponseBody {
 		return false, false, fmt.Errorf("vm.info response exceeds %d bytes", maxReadyResponseBody)
 	}
-	if resp.StatusCode == http.StatusInternalServerError && isVMNotCreated(body) {
+	if (resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusNotFound) && isVMNotCreated(body) {
 		return false, true, fmt.Errorf("VM is not created")
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -307,4 +307,23 @@ func requireJSONEOF(dec *json.Decoder) error {
 		return err
 	}
 	return nil
+}
+
+// CaptureProtect inhibits physical balloon discard during before-image capture.
+// Enabling requires paused CH; disabling follows reader/protection teardown.
+func (c Client) CaptureProtect(enabled bool) error {
+	body := "false"
+	if enabled {
+		body = "true"
+	}
+	return c.do("PUT", "/api/v1/vm.capture-protect", body)
+}
+
+// ResizeDisk publishes the already committed native backend geometry to virtio.
+func (c Client) ResizeDisk(ctx context.Context, id string, size uint64) error {
+	body, err := json.Marshal(map[string]any{"id": id, "desired_size": size})
+	if err != nil {
+		return err
+	}
+	return c.doContext(ctx, "PUT", "/api/v1/vm.resize-disk", string(body))
 }

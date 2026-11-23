@@ -15,10 +15,11 @@ import (
 // Devices use the existing minimal virtio feature profile; slice order fixes
 // device order. A zero-capacity slot adopts its source geometry exactly once.
 type BlockDeviceSpec struct {
-	CapacityChange bool  // preserve the original dynamic protocol for a bound restore
-	Capacity       int64 // bytes, sector aligned
-	Slot           bool  // independently bound writable device
-	ReadOnly       bool
+	LateBindReadOnly bool  // image-independent root: geometry is fixed by the one initial Bind
+	CapacityChange   bool  // preserve the original dynamic protocol for a bound restore
+	Capacity         int64 // bytes, sector aligned
+	Slot             bool  // independently bound writable device
+	ReadOnly         bool
 }
 
 // ErrBackendUnbound is a normal device I/O failure, not a fatal storage error
@@ -48,10 +49,13 @@ func NewBackendSet(specs []BlockDeviceSpec) (*BackendSet, error) {
 	s := &BackendSet{specs: append([]BlockDeviceSpec(nil), specs...)}
 	s.devices = make([]Backend, len(specs))
 	for i, spec := range s.specs {
+		if spec.LateBindReadOnly && (!spec.ReadOnly || spec.Slot || spec.Capacity != 0) {
+			return nil, fmt.Errorf("vhost: invalid late-bound read-only device %d", i)
+		}
 		if spec.Slot && spec.ReadOnly {
 			return nil, fmt.Errorf("vhost: device %d read-only slot", i)
 		}
-		if spec.Capacity < 0 || (spec.Capacity == 0 && !spec.Slot) || spec.Capacity%SectorSize != 0 {
+		if spec.Capacity < 0 || (spec.Capacity == 0 && !spec.Slot && !spec.LateBindReadOnly) || spec.Capacity%SectorSize != 0 {
 			return nil, fmt.Errorf("vhost: device %d capacity %d must be positive and sector-aligned", i, spec.Capacity)
 		}
 		if !spec.ReadOnly && spec.Capacity != 0 {
@@ -134,7 +138,11 @@ func (s *BackendSet) validateBackend(i int, b Backend) error {
 	}
 	spec := s.specs[i]
 	size := b.Size()
-	if spec.Slot && spec.Capacity == 0 {
+	if spec.LateBindReadOnly {
+		if size <= 0 || size%SectorSize != 0 {
+			return fmt.Errorf("vhost: late-bound image size %d is invalid", size)
+		}
+	} else if spec.Slot && spec.Capacity == 0 {
 		if err := diffstore.ValidateWritableSize(size); err != nil {
 			return fmt.Errorf("vhost: device %d: %w", i, err)
 		}
@@ -224,5 +232,5 @@ func backendForRequest(b Backend) Backend {
 // capacity after publication, including across a reconnect or restore.
 func DynamicSlot(b Backend) bool {
 	s, ok := b.(*backendSlot)
-	return ok && s.unbound.spec.Slot && (s.unbound.spec.Capacity == 0 || s.unbound.spec.CapacityChange)
+	return ok && (s.unbound.spec.LateBindReadOnly || (s.unbound.spec.Slot && (s.unbound.spec.Capacity == 0 || s.unbound.spec.CapacityChange)))
 }

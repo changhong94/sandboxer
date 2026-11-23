@@ -114,3 +114,15 @@ func explicitMemoryBytes(source sparse.Source) (uint64, error) {
 	}
 	return explicit, nil
 }
+
+// privateCaptureSource describes a complete, frozen private-RAM capture. With
+// no memory ancestry the final reader already resolves absent pages to zero.
+// Preserve explicit Zero whenever any parent/merge input exists: Hole there
+// would reveal obsolete parent bytes. Disk ancestry is independent.
+func privateCaptureSource(fd int, size uint64, zeros []sparse.Extent, s *Sources) sparse.Source {
+	out := &releasedMemorySource{fd: fd, size: size, zeros: zeros}
+	if len(s.MemoryFromRefs) == 0 && s.MergeBaseSnapshot == "" && s.MemoryFallbackBase == nil && s.MemoryProofCandidates == nil {
+		out.holes, out.zeros = zeros, nil
+	}
+	return out
+}

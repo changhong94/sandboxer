@@ -642,6 +642,10 @@ Zero 批次只写元数据，不复制或加密 payload；成功后归还两种�
 中重放的前缀。后端元数据工作仍在 Store 内串行，不相关 cache miss 仍可能等待。
 缓存 ACK 不承诺宿主空间可立即复用。
 
+本迁移分支中，启用 checkpoint 的运行时磁盘显式选择 `WithDurableFlush`：
+FLUSH 等待已接收写入完成回写并同步底层文件，checkpoint 注册也在返回前同步。
+以下上游临时磁盘策略仅适用于没有选择该选项的调用方。
+
 健康且合法的 guest **FLUSH 是 no-op**，不发起回写、不等待脏页、不调用 Drain、fsync 或
 fdatasync。请求顺序和 fatal 状态检查保留。为兼容 Cloud Hypervisor 快照，保留现有 wire
 features。新建可写设备公布 DISCARD，只读设备不公布；不增加 CONFIG_WCE 或

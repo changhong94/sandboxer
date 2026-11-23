@@ -14,8 +14,8 @@
 #   - patches-apply requires HEAD == ch-patches-base; otherwise refuses
 #     and tells the user to format-extract WIP first, then reset.
 #   - patches-format clears stale .patch files before regenerating.
-#   - build skips when the binary and material records already exist; Cargo
-#     otherwise reuses its normal incremental cache.
+#   - build reuses complete artifacts only for identical source/toolchain inputs;
+#     Cargo otherwise reuses its normal incremental cache.
 #
 # Inputs (env, all optional):
 #   CLOUD_HYPERVISOR_TARBALL         URL or local path; supports "url#filename" form.
@@ -146,6 +146,13 @@ Then re-run."
     done)
 
     if [ "$applied_subjects" = "$patch_subjects" ]; then
+        local commits=() i expected actual
+        mapfile -t commits < <(git -C "$CH_SRC" rev-list --reverse "$CH_BASE_TAG..HEAD")
+        for i in "${!patches[@]}"; do
+            expected=$(git patch-id --stable < "${patches[$i]}" | awk '{print $1}')
+            actual=$(git -C "$CH_SRC" show "${commits[$i]}" | git patch-id --stable | awk '{print $1}')
+            [ "$expected" = "$actual" ] || die "patch content differs from source: ${patches[$i]}; preserve WIP and rebuild the source tree from the patch series"
+        done
         log "all ${#patches[@]} patch(es) already applied at HEAD — skipping git am"
         return 0
     fi
@@ -188,7 +195,11 @@ do_build() (
     local out_bin="$BINDIR/cloud-hypervisor"
     local report="${CH_BUILD_REPORT:-$CH_BUILD_OUT/build-report.jsonl}"
     local link_map="${CH_LINK_MAP:-$CH_BUILD_OUT/link.map}"
-    if [ -x "$out_bin" ] && [ -s "$report" ] && [ -s "$link_map" ]; then
+    require_cmd cargo rustc python3
+    local input_stamp="$out_bin.inputs.sha256" input_digest
+    input_digest=$(python3 "$script_dir/ch-build-inputs.py" "$CH_SRC" "$PATCHES_DIR")
+    if [ -x "$out_bin" ] && [ -s "$report" ] && [ -s "$link_map" ] && \
+       [ -f "$input_stamp" ] && [ "$(cat "$input_stamp")" = "$input_digest" ]; then
         log "already built: $out_bin (build materials retained)"
         exit 0
     fi
@@ -272,6 +283,11 @@ do_build() (
     chmod +x "$out_bin"
     mv "$pending_map" "$link_map"
     mv "$pending_report" "$report"
+    # Publish the matching input stamp last; a failed build cannot certify an
+    # old output as current. Reject edits made during compilation.
+    [ "$(python3 "$script_dir/ch-build-inputs.py" "$CH_SRC" "$PATCHES_DIR")" = "$input_digest" ] || die "Cloud Hypervisor inputs changed during build"
+    printf '%s\n' "$input_digest" > "$input_stamp.pending"
+    mv "$input_stamp.pending" "$input_stamp"
     log "built $out_bin ($(du -h "$out_bin" | cut -f1))"
     # --version only runs on host-native binaries; cross-builds show file info instead.
     if [ -z "${RUST_TARGET:-}" ] || [ "$RUST_TARGET" = "$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')" ]; then

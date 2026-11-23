@@ -419,3 +419,32 @@ func TestBackendSetRejectsDeviceFrontendBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLateBoundReadOnlyImageAdoptsGeometryOnce(t *testing.T) {
+	for _, size := range []int{4096, 32768} {
+		set := bindingSetForTest(t, BlockDeviceSpec{ReadOnly: true, LateBindReadOnly: true})
+		frontend := set.DeviceBackends()[0]
+		if frontend.Size() != 0 || !DynamicSlot(frontend) {
+			t.Fatal("generic image frontend has premature geometry")
+		}
+		wrong := &minimalProfileBackend{memBackend: &memBackend{data: make([]byte, size)}, readOnly: false}
+		if set.Bind([]Backend{wrong}) == nil {
+			t.Fatal("writable image accepted")
+		}
+		backend := &minimalProfileBackend{memBackend: &memBackend{data: make([]byte, size)}, readOnly: true}
+		if err := set.Bind([]Backend{backend}); err != nil {
+			t.Fatal(err)
+		}
+		if frontend.Size() != int64(size) || !frontend.ReadOnly() {
+			t.Fatal("image geometry not published")
+		}
+		if !errors.Is(set.Bind([]Backend{backend}), ErrBackendSetBound) {
+			t.Fatal("assigned image could be replaced")
+		}
+	}
+	for _, spec := range []BlockDeviceSpec{{LateBindReadOnly: true}, {LateBindReadOnly: true, ReadOnly: true, Capacity: 4096}, {LateBindReadOnly: true, ReadOnly: true, Slot: true}} {
+		if _, err := NewBackendSet([]BlockDeviceSpec{spec}); err == nil {
+			t.Fatal("invalid generic image shape accepted")
+		}
+	}
+}

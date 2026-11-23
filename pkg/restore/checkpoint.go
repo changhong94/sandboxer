@@ -16,7 +16,7 @@ import (
 // prepareRestoreCheckpoint pins the complete source set before acquiring the
 // target directory. The full release is registered before disk closers by Run;
 // source pins are also released as soon as the target disks no longer need them.
-func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedSandboxSource) (_ Options, _ *openedSandboxSource, release func() error, retErr error) {
+func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedSandboxSource, nativeBranch ...bool) (_ Options, _ *openedSandboxSource, release func() error, retErr error) {
 	var closes []func() error
 	release = func() error {
 		var err error
@@ -80,7 +80,11 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 		return opts, source, release, err
 	}
 	closes = append(closes, func() error { return os.RemoveAll(materialDir) })
-	result, err := storage.MaterializePinnedCheckpoint(ctx, source.SelectedRef, opts.RefLocations, materialDir, pins)
+	materialize := storage.MaterializePinnedCheckpoint
+	if len(nativeBranch) != 0 && nativeBranch[0] {
+		materialize = storage.BranchPinnedCheckpoint
+	}
+	result, err := materialize(ctx, source.SelectedRef, opts.RefLocations, materialDir, pins)
 	if err != nil {
 		return opts, source, release, fmt.Errorf("restore: materialize Checkpoint: %w", err)
 	}

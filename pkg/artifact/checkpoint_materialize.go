@@ -257,6 +257,16 @@ func (s *ProcessStorage) MaterializeCheckpoint(ctx context.Context, input string
 
 // MaterializePinnedCheckpoint consumes already pinned versions without another identity lookup.
 func (s *ProcessStorage) MaterializePinnedCheckpoint(ctx context.Context, input string, locations config.RefLocations, directory string, pins *PinnedDiffCheckpoints) (result PublishResult, retErr error) {
+	return s.materializePinnedCheckpoint(ctx, input, locations, directory, pins, false)
+}
+
+// BranchPinnedCheckpoint shares immutable local disk carriers while publishing
+// only the captured writable delta. It never links a live DIFF store.
+func (s *ProcessStorage) BranchPinnedCheckpoint(ctx context.Context, input string, locations config.RefLocations, directory string, pins *PinnedDiffCheckpoints) (PublishResult, error) {
+	return s.materializePinnedCheckpoint(ctx, input, locations, directory, pins, true)
+}
+
+func (s *ProcessStorage) materializePinnedCheckpoint(ctx context.Context, input string, locations config.RefLocations, directory string, pins *PinnedDiffCheckpoints, branch bool) (result PublishResult, retErr error) {
 	directory, err := filepath.Abs(directory)
 	if err != nil {
 		return result, err
@@ -266,10 +276,16 @@ func (s *ProcessStorage) MaterializePinnedCheckpoint(ctx context.Context, input 
 	}
 	p := newPublisher(s, locations, newLocationPublishTarget("", directory, s.LocalCodec(), s.LocalRequired(), func(string, ...any) {}), nil)
 	p.checkpointPins = pins
+	p.linkImmutableDisks = branch
 	result, retErr = p.Publish(ctx, input)
 	retErr = errors.Join(retErr, p.Close())
 	if retErr != nil {
 		return PublishResult{}, retErr
+	}
+	if branch {
+		if err := snapshot.SyncLocalPublication(ctx, directory); err != nil {
+			return PublishResult{}, err
+		}
 	}
 	return result, nil
 }

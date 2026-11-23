@@ -801,13 +801,13 @@ crypto:
 
 发布时原样保留已发布的磁盘和内存父引用，不打开或校验对应文件。普通 E/S 发布、Bundle 发布和直接 `PublishSource` 都遵循此规则；不会仅为保留引用而要求父位置映射、父文件可用或父层密钥。发布不会验证或迁移整个历史引用图。真正发生的读取仍执行配置的加密策略和预期身份校验，包括物化 checkpoint、转换源，以及为确认 checkpoint 元数据而读取当前选中 E。新目标及目标碰撞复用仍要完整校验数据流。Manifest 和 Bundle 沿用原有编码、认证与精确复制语义；来源选择和传输实际需要的 carrier 读取仍然保留。
 
-复用发布目标位置已经存在的输出文件时，必须重新验证 role、logical size、content identity 和完整 stream。 Local output与named ref-location的commit策略刻意分离. Artifact capture/publication只定义logical completion,不定义stable-storage durability:local output依赖完整写入、`Close()`检查、内容寻址no-replace rename与alias atomic rename;named-location依赖`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查. 两种 artifact-publication 路径都不执行显式 file/directory flush，物理写回由文件系统或底层存储实现定义；这不同于 [Strict encoding 与 limits](#encoding-limits) 中执行 fsync 的 run-directory C0 写入。
+复用已存在的发布文件时，仍必须验证角色、逻辑大小、内容身份和完整数据流。本迁移分支的本地快照会在返回成功前同步文件、目标目录及别名目录链。named ref-location 仍采用独占创建、关闭检查和重新打开完整校验；fork 发布辅助程序还会同步引用的本地存储目录后才返回成功。普通 named-location 发布接口本身仍保留上游的逻辑完成语义。
 
 <a id="local-output"></a>
 
 ### Local output
 
-`snapshot/export --output` 的 `FileSink` 在output directory中写unique same-directory temp,完整写入并检查`Close`错误,再以`renameat2(RENAME_NOREPLACE)`完成O(1) final commit. `BundleSink`同样以当前atomic no-replace rename提交完整Bundle;两条本地路径都不会为了final commit再读取并复制完整artifact. Root成功后,semantic alias用随机temporary symlink + atomic rename更新. Alias target和existing entry都以`NOFOLLOW`/`lstat` fail closed,不会把regular file或directory替换成symlink;commit由完整写入、`Close()`检查与atomic rename定义,不执行显式file/directory fsync. 因此local output要求节点本地filesystem提供这些atomic rename和symlink语义.
+`snapshot/export --output` 的 `FileSink` 使用同目录临时文件，写完并同步后执行不覆盖已有目标的原子 rename。`BundleSink` 也同步完整 Bundle 后提交。两者都不会仅为了提交而复制整份产物。根产物成功后更新别名并同步目录链；同步错误会使操作失败。别名通过 `NOFOLLOW`/`lstat` 校验，拒绝替换普通文件或目录。
 
 <a id="named-output"></a>
 
@@ -918,7 +918,7 @@ rebuild S -> publish S last
 
 ## Atomicity 与 determinism
 
-Portable YAML和E/S ZIP使用canonical order、fixed metadata和bounded bytes. Local `FileSink`/`BundleSink`保持same-directory temp、完整写入/`Close()`检查和atomic no-replace rename,final commit是O(1);alias只在root commit后更新. artifact capture/publication只定义logical completion,不定义stable-storage durability;两条本地路径都不执行显式file/directory fsync,物理写回由文件系统或底层存储实现定义. Named ref-location采用独立的exclusive-create + checked-write/copy-once + reopen-full-verify协议;tarstream由carrier直接提供identity,Bundle保持exact bytes,两者都不进入local sink的capture/commit路径.
+Portable YAML 和 E/S ZIP 保留确定性顺序、固定元数据和有界数据。本地 FileSink/BundleSink 在内容同步后原子提交，别名只在根产物提交后更新并同步目录。named ref-location 使用独立的独占创建、完整校验流程；fork 发布辅助程序在该流程之后额外执行持久化屏障。
 
 多盘顺序固定为data disks first、root E last. Snapshot随后写memory S last. 这让S/E root成为可审计的graph commit point.
 

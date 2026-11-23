@@ -1,0 +1,100 @@
+From c85bedb329da79be6fce01669c1cec859ffa9e52 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 19 Nov 2026 18:34:04 -0700
+Subject: [PATCH] net: drop transmit packets when the host TAP is
+ administratively down
+
+---
+ net_util/src/queue_pair.rs            | 15 ++++++++++++---
+ net_util/src/tap.rs                   | 17 +++++++++++++++++
+ virtio-devices/src/seccomp_filters.rs | 13 +++++++++++--
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/net_util/src/queue_pair.rs b/net_util/src/queue_pair.rs
+index 570410f..15e9118 100644
+--- a/net_util/src/queue_pair.rs
++++ b/net_util/src/queue_pair.rs
+@@ -92,7 +92,7 @@ impl TxVirtio {
+                 0
+             } else {
+                 // SAFETY: FFI call with correct arguments
+-                let result = unsafe {
++                let mut result = unsafe {
+                     libc::writev(
+                         tap.as_raw_fd() as libc::c_int,
+                         iovecs.as_ptr(),
+@@ -109,8 +109,17 @@ impl TxVirtio {
+                         retry_write = true;
+                         break;
+                     }
+-                    error!("net: tx: failed writing to tap: {e}");
+-                    return Err(NetQueuePairError::WriteTap(e));
++                    if e.raw_os_error() == Some(libc::EIO)
++                        && tap.is_link_down().unwrap_or(false)
++                    {
++                        // Link-down is an intentional drop, not backpressure.
++                        // Complete the descriptor rather than retaining stale
++                        // traffic for replay when the host opens the link.
++                        result = vnet_hdr_len() as isize;
++                    } else {
++                        error!("net: tx: failed writing to tap: {e}");
++                        return Err(NetQueuePairError::WriteTap(e));
++                    }
+                 }
+ 
+                 if (result as usize) < vnet_hdr_len() {
+diff --git a/net_util/src/tap.rs b/net_util/src/tap.rs
+index 18635ab..7378bd1 100644
+--- a/net_util/src/tap.rs
++++ b/net_util/src/tap.rs
+@@ -394,6 +394,23 @@ impl Tap {
+         unsafe { Self::ioctl_with_ref(&sock, net_gen::sockios::SIOCSIFHWADDR as c_ulong, &ifreq) }
+     }
+ 
++    /// An administratively down TAP rejects writes with EIO. Distinguish that
++    /// expected packet drop from a broken descriptor or malformed framing.
++    pub fn is_link_down(&self) -> Result<bool> {
++        let sock = create_unix_socket().map_err(Error::NetUtil)?;
++        let mut ifreq = self.get_ifreq();
++        // SAFETY: valid interface request and socket; the ioctl result is checked.
++        unsafe {
++            Self::ioctl_with_mut_ref(
++                &sock,
++                net_gen::sockios::SIOCGIFFLAGS as c_ulong,
++                &mut ifreq,
++            )?
++        };
++        // SAFETY: SIOCGIFFLAGS initialized this union member.
++        Ok(unsafe { ifreq.ifr_ifru.ifru_flags } & libc::IFF_UP as c_short == 0)
++    }
++
+     /// Get mac addr for tap interface.
+     pub fn get_mac_addr(&self) -> Result<MacAddr> {
+         let sock = create_unix_socket().map_err(Error::NetUtil)?;
+diff --git a/virtio-devices/src/seccomp_filters.rs b/virtio-devices/src/seccomp_filters.rs
+index e846364..ccae242 100644
+--- a/virtio-devices/src/seccomp_filters.rs
++++ b/virtio-devices/src/seccomp_filters.rs
+@@ -155,8 +155,17 @@ fn virtio_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+         (libc::SYS_readv, vec![]),
+         (libc::SYS_timerfd_settime, vec![]),
+         (libc::SYS_writev, vec![]),
+-        #[cfg(feature = "sev_snp")]
+-        (libc::SYS_ioctl, create_mshv_sev_snp_ioctl_seccomp_rule()),
++        // Query only administrative link state after a TAP write returns EIO.
++        (libc::SYS_socket, or![and![
++            Cond::new(0, ArgLen::Dword, Eq, libc::AF_UNIX as _).unwrap(),
++            Cond::new(1, ArgLen::Dword, Eq, libc::SOCK_DGRAM as _).unwrap(),
++            Cond::new(2, ArgLen::Dword, Eq, 0).unwrap()
++        ]]),
++        (libc::SYS_ioctl, or![
++            and![Cond::new(1, ArgLen::Dword, Eq, libc::SIOCGIFFLAGS as _).unwrap()],
++            #[cfg(feature = "sev_snp")]
++            mshv_sev_snp_ioctl_seccomp_rule(),
++        ]),
+     ]
+ }
+ 
+-- 
+2.34.1
+

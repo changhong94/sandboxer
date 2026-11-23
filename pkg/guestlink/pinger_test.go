@@ -922,3 +922,58 @@ func TestSendQuiesce_WrongResponse(t *testing.T) {
 		t.Error("expected error on wrong response")
 	}
 }
+
+func TestForkRestoreRequiresExplicitAck(t *testing.T) {
+	for _, ack := range []string{proto.TypeRestoreAck, proto.TypeForkRestoreAck} {
+		t.Run(ack, func(t *testing.T) {
+			base := filepath.Join(t.TempDir(), "vsock.sock")
+			proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+				req, err := proto.ReadMessage(c)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if req.Type != proto.TypeForkRestore || req.Network.MAC != "02:aa:00:00:00:02" {
+					t.Errorf("wrong request: %+v", req)
+				}
+				_ = proto.WriteMessage(c, &proto.Message{Type: ack, Epoch: req.Epoch})
+			})
+			defer proxy.close()
+			conn, _, err := OpenMUXViaRestore(&HostClient{BasePath: base, Logf: t.Logf}, 1, &proto.NetworkSpec{MAC: "02:aa:00:00:00:02", IPCIDR: "10.0.0.2/24"}, time.Second)
+			if conn != nil {
+				conn.Close()
+			}
+			if (err == nil) != (ack == proto.TypeForkRestoreAck) {
+				t.Fatalf("ack=%s error=%v", ack, err)
+			}
+		})
+	}
+}
+
+func TestForkWithoutNICStillRenewsEntropy(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "vsock.sock")
+	seeds := make(chan []byte, 2)
+	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
+		req, err := proto.ReadMessage(c)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if req.Type != proto.TypeForkRestore || req.Network != nil || len(req.ForkEntropy) != 32 {
+			t.Errorf("invalid fork identity request")
+		}
+		seeds <- append([]byte(nil), req.ForkEntropy...)
+		_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypeForkRestoreAck, Epoch: req.Epoch})
+	})
+	defer proxy.close()
+	for range 2 {
+		conn, _, err := OpenMUXViaForkContext(context.Background(), &HostClient{BasePath: base, Logf: t.Logf}, 1, nil, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+	}
+	if string(<-seeds) == string(<-seeds) {
+		t.Fatal("reused fork entropy")
+	}
+}

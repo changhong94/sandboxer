@@ -6,8 +6,10 @@ package restore
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"log"
 	"math"
@@ -15,7 +17,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -25,7 +29,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/chmemory"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/internal/runidentity"
 	"github.com/kuasar-sandbox/sandboxer/internal/sourcebind"
@@ -56,6 +59,18 @@ import (
 // Disk refs in the referenced Sandbox E likewise support manifest:// when
 // Fetcher is set. Parent .sandbox refs are always narrowed to their Payload.
 type Options struct {
+	RestoreEnvdInit   []byte
+	RestoreEnvdSocket string
+	PreparedSources   *PreparedSources
+	// SandboxRefHint permits speculative local metadata reads only. Snapshot S
+	// remains authoritative; a mismatching hint is discarded before use.
+	SandboxRefHint  string
+	PreparedRestore *sandbox.PreparedRestore
+	PrivateRAMFork  bool
+	// ForkNetworkIdentity applies fork identity renewal even without a NIC.
+	// It also rebinds a captured NIC to a distinct child identity.
+	// It requires a matching guest fork_restore ACK before Ready.
+	ForkNetworkIdentity bool
 	storage             *artifact.ProcessStorage
 	EnableCheckpoint    bool // persistent multi-version writable disks
 	CurrentRun          *artifact.CurrentRun
@@ -96,7 +111,8 @@ type Options struct {
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
 
-	checkpointReleaseSources func() error // temporary source pins; writers own the handoff
+	borrowedDiskSource       *openedSandboxSource // owned by Run until all disk backends close
+	checkpointReleaseSources func() error         // temporary source pins; writers own the handoff
 }
 
 func (opts Options) borrowStorage() (*artifact.ProcessStorage, error) {
@@ -123,6 +139,38 @@ func (opts Options) openFile(ctx context.Context, path string, ref manifest.Ref)
 
 // Run executes restore. Returns the CH exit code.
 func Run(ctx context.Context, opts Options) (code int, retErr error) {
+	phaseStarted := time.Now()
+	type phaseTiming struct {
+		name             string
+		start, end       time.Time
+		startTID, endTID int
+		processCPU       int64
+	}
+	phases := make([]phaseTiming, 0, 40)
+	lastTID := syscall.Gettid()
+	lastCPU := restoreProcessCPU()
+	markRestore := func(name string) {
+		now := time.Now()
+		tid := syscall.Gettid()
+		cpu := restoreProcessCPU()
+		phases = append(phases, phaseTiming{name, phaseStarted, now, lastTID, tid, cpu - lastCPU})
+		lastTID = tid
+		lastCPU = cpu
+		phaseStarted = now
+	}
+	flushRestore := func() {
+		if len(phases) == 0 {
+			return
+		}
+		var lines strings.Builder
+		for _, p := range phases {
+			fmt.Fprintf(&lines, "[restore timing] phase=%s elapsed=%s start_ns=%d end_ns=%d pid=%d start_tid=%d end_tid=%d process_cpu_ns=%d\n", p.name, p.end.Sub(p.start), p.start.UnixNano(), p.end.UnixNano(), os.Getpid(), p.startTID, p.endTID, p.processCPU)
+		}
+		log.Print(lines.String())
+		phases = phases[:0]
+	}
+	defer flushRestore()
+	markRestore("entry")
 	if opts.SnapshotPath == "" && opts.SnapshotManifestKey == "" {
 		return -1, errors.New("restore: SnapshotPath or SnapshotManifestKey required")
 	}
@@ -183,34 +231,60 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if opts.CHBinary == "" {
 		opts.CHBinary = "cloud-hypervisor"
 	}
-	root, err := openRootSnapshot(ctx, opts)
+	markRestore("host_setup")
+	preparedSources, err := opts.PreparedSources.take(opts)
+	if err != nil {
+		return -1, fmt.Errorf("prepared sources: %w", err)
+	}
+	var speculativeSource *sandboxSourceHint
+	if !preparedSources {
+		speculativeSource = startSandboxSourceHint(ctx, opts)
+	}
+	defer speculativeSource.close()
+	var root *openedRootSnapshot
+	if preparedSources {
+		root = opts.PreparedSources.root
+	} else {
+		root, err = openRootSnapshot(ctx, opts)
+	}
 	if err != nil {
 		return -1, fmt.Errorf("open snapshot: %w", err)
 	}
 	opts = root.opts
-	snapshotRoot, err := snapshotfile.Open(ctx, root.stream)
+	markRestore("root_open")
+	var snapshotRoot *snapshotfile.Root
+	if preparedSources {
+		snapshotRoot = opts.PreparedSources.snapshot
+	} else {
+		snapshotRoot, err = snapshotfile.Open(ctx, root.stream)
+	}
 	if err != nil {
 		return -1, fmt.Errorf("open Snapshot S: %w", err)
 	}
 	defer snapshotRoot.Close()
-	memoryConfig, err := snapshot.ParseConfig(snapshotRoot.SnapshotConfig)
+	var memoryConfig *snapshot.Config
+	if preparedSources {
+		memoryConfig = opts.PreparedSources.memory
+	} else {
+		memoryConfig, err = snapshot.ParseCanonicalConfig(snapshotRoot.SnapshotConfig)
+	}
 	if err != nil {
 		return -1, fmt.Errorf("unsupported snapshot format/version: %w", err)
 	}
-	canonicalSnapshotConfig, err := snapshot.MarshalConfig(memoryConfig)
-	if err != nil {
-		return -1, err
-	}
-	if string(canonicalSnapshotConfig) != string(snapshotRoot.SnapshotConfig) {
-		return -1, errors.New("snapshot.cfg is not canonically encoded")
-	}
 
-	sandboxSource, err := openReferencedSandbox(ctx, memoryConfig.SandboxRef, opts)
+	markRestore("snapshot_decode")
+	var sandboxSource *openedSandboxSource
+	if preparedSources {
+		sandboxSource = opts.PreparedSources.sandbox
+	} else {
+		sandboxSource, err = speculativeSource.take(ctx, memoryConfig.SandboxRef, opts)
+	}
 	if err != nil {
 		return -1, fmt.Errorf("open snapshot.cfg sandbox_ref: %w", err)
 	}
 	defer sandboxSource.Root.Close()
 	opts = sandboxSource.opts
+	markRestore("sandbox_open")
 	opts, sandboxSource, releaseCheckpoint, err := prepareRestoreCheckpoint(ctx, opts, sandboxSource)
 	if err != nil {
 		return -1, err
@@ -221,7 +295,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
+	markRestore("checkpoint_prepare")
 	opts.ArtifactRelativeDir = sandboxSource.RelativeDir
+	opts.borrowedDiskSource = sandboxSource
 	sourcebind.ApplyDefaultBootBindings(opts.HostCfg, sandboxSource.Root.Portable, sandboxSource.RelativeDir)
 	merged, c0, err := config.ApplyRestoreRules(sandboxSource.Root.Portable, opts.HostCfg, opts.HostPresence)
 	if err != nil {
@@ -231,9 +307,20 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, err
 	}
 	snapCfg := *merged
+	// Pure state preparation overlaps disk/source validation. No provider link
+	// is touched and the real lease identity is checked again before use.
+	var preparedNetwork *forkNetworkRewrite
+	if opts.ForkNetworkIdentity || opts.PrivateRAMFork {
+		preparedNetwork = opts.PreparedSources.preparedNetwork(snapCfg.Network.MAC)
+		if preparedNetwork == nil {
+			preparedNetwork = startForkNetworkRewrite(snapshotRoot.ConfigJSON, snapshotRoot.StateJSON, snapCfg.Network.MAC)
+		}
+		defer preparedNetwork.Wait()
+	}
 	// The running guest kernel is already captured in Snapshot S. Only the
 	// external runtime PMEM backing must be rebound to matching local content.
-	runtimePath, err := ResolveRuntimeBinding(ctx, snapCfg.Boot.Runtime, c0.Boot.Runtime)
+	markRestore("config_merge")
+	runtimePath, err := opts.PreparedSources.slotRuntimeBinding(ctx, snapCfg.Boot.Runtime, c0.Boot.Runtime)
 	if err != nil {
 		return -1, err
 	}
@@ -247,20 +334,33 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("Sandbox source binding: %w", err)
 	}
 
+	stagedDisks := false
 	if opts.EnableCheckpoint {
-		bases, err := c0.Checkpointed(sandboxSource.PortableRef)
+		stagedDisks, err = opts.PreparedSources.adoptSlotDisksForPortable(&snapCfg, c0, sandboxSource.PortableRef, &opts)
 		if err != nil {
 			return -1, err
 		}
-		opts.checkpointPlan, err = sandbox.PrepareCheckpointDiskPlan(&snapCfg, bases, filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint"), opts.checkpointReopen)
-		if err != nil {
-			return -1, err
+		if !stagedDisks {
+			bases, baseErr := c0.Checkpointed(sandboxSource.PortableRef)
+			if baseErr != nil {
+				return -1, baseErr
+			}
+			stagedDisks, err = opts.PreparedSources.adoptSlotDisks(&snapCfg, bases, &opts)
+			if err == nil && !stagedDisks {
+				opts.checkpointPlan, err = sandbox.PrepareCheckpointDiskPlan(&snapCfg, bases, filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint"), opts.checkpointReopen)
+			}
+			if err != nil {
+				return -1, err
+			}
 		}
 	}
-	if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey); err != nil {
-		return -1, fmt.Errorf("restore disk graph preflight: %w", err)
-	}
+	if !stagedDisks {
+		if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey); err != nil {
+			return -1, fmt.Errorf("restore disk graph preflight: %w", err)
+		}
 
+	}
+	markRestore("runtime_binding")
 	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
 	runtimeMemoryRef := root.selfRef
@@ -302,6 +402,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		logf("manifest snapshot: key=%s bundle_size=%d", opts.SnapshotManifestKey, totalSize)
 	}
 
+	markRestore("paths_and_source")
 	snapshotHasNetwork, err := snapshotConfigHasNetwork(snapshotRoot.ConfigJSON)
 	if err != nil {
 		return -1, err
@@ -336,41 +437,17 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// CH snapshot config is the Capacity authority. The referenced Sandbox E
 	// portable config must describe the exact captured CPU topology and memory
 	// byte domain, but it is not used to infer CH's restored shape.
-	if err := validateSnapshotVCPUTopology(snapshotRoot.ConfigJSON, snapCfg.Resources.Capacity.CPU); err != nil {
-		return -1, err
-	}
-	snapCap, err := chmemory.CapacityFromVMConfig(snapshotRoot.ConfigJSON)
-	if err != nil {
-		return -1, fmt.Errorf("snapshot CH capacity: %w", err)
-	}
-	if err := validateMemoryMapping(snapshotRoot.ConfigJSON, snapshotRoot.StateJSON, snapCap); err != nil {
-		return -1, err
-	}
 	declaredCap, err := snapCfg.CapacityMemoryBytes()
 	if err != nil {
 		return -1, fmt.Errorf("referenced Sandbox capacity: %w", err)
 	}
-	if declaredCap != snapCap {
-		return -1, fmt.Errorf("snapshot Capacity mismatch: CH memory zones=%d Sandbox=%d", snapCap, declaredCap)
-	}
-	if snapshotRoot.ArchiveBase != snapCap {
-		return -1, fmt.Errorf("snapshot memory payload size=%d does not match CH capacity=%d", snapshotRoot.ArchiveBase, snapCap)
-	}
-	if snapCap > uint64(^uint(0)>>1) {
-		return -1, fmt.Errorf("restore Capacity %d exceeds host addressable memory size", snapCap)
-	}
-	balTarget, balCurrent, balOk, err := parseBalloonFromState(snapshotRoot.StateJSON)
+	shape, err := resolvePreparedShape(snapshotRoot.ConfigJSON, snapshotRoot.StateJSON, snapCfg.Resources.Capacity.CPU, declaredCap, snapshotRoot.ArchiveBase, opts)
 	if err != nil {
-		return -1, fmt.Errorf("parse balloon from state.json: %w", err)
+		return -1, err
 	}
-	if balOk {
-		if err := resctl.ValidateBalloonSize(snapCap, balTarget); err != nil {
-			return -1, fmt.Errorf("snapshot balloon target: %w", err)
-		}
-		if err := resctl.ValidateBalloonSize(snapCap, balCurrent); err != nil {
-			return -1, fmt.Errorf("snapshot balloon current: %w", err)
-		}
-	}
+	snapCap, privateRAM := shape.Capacity, shape.Private
+	balTarget, balCurrent, balOk := shape.BalloonTarget, shape.BalloonCurrent, shape.Balloon
+	markRestore("topology_validation")
 	settledHeadroom, err := snapCfg.AllocatableMemoryBytes()
 	if err != nil {
 		return -1, fmt.Errorf("restore settled headroom: %w", err)
@@ -391,6 +468,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// cgroup, controller lease, network provider, memfd, or VM state. Keep these
 	// exact streams for the later UFFD chain so validation and use cannot race a
 	// second lookup of the same ref.
+	markRestore("balloon_validation")
 	parentMemoryLayers, err := openMemoryParentLayers(ctx, memoryConfig.FromRefs, opts, snapCap)
 	if err != nil {
 		return -1, err
@@ -417,7 +495,8 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// side effects. Only after every deterministic format/topology/capacity check
 	// succeeds do we create the run directory and persist immutable C0.
 	vsockSock := filepath.Join(runDir, "vsock.sock")
-	rewritten, err := rewriteConfigPaths(snapshotRoot.ConfigJSON, pathRewrite{
+	markRestore("memory_parents")
+	rewritten, err := opts.PreparedSources.slotRewrite(snapshotRoot.ConfigJSON, pathRewrite{
 		UffdSocket:   uffdSock,
 		DiskSocks:    diskSocks,
 		DiskReadOnly: diskReadOnly,
@@ -428,6 +507,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("rewrite config.json: %w", err)
 	}
+	markRestore("rewrite_config")
 	identity, err := runidentity.Acquire(runDir, opts.SandboxID)
 	if err != nil {
 		return -1, fmt.Errorf("restore runtime identity: %w", err)
@@ -437,19 +517,25 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return -1, err
 	}
-	if _, err := config.WritePortableSandboxConfig(runDir, c0); err != nil {
-		return -1, fmt.Errorf("write immutable C0: %w", err)
+	portablePublished, err := opts.PreparedSources.publishPortable(runDir, c0)
+	if err != nil {
+		return -1, fmt.Errorf("publish immutable C0: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), snapshotRoot.StateJSON, 0o644); err != nil {
-		return -1, err
+	if !portablePublished {
+		if _, err := config.WritePortableSandboxConfig(runDir, c0); err != nil {
+			return -1, fmt.Errorf("write immutable C0: %w", err)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "config.json"), rewritten, 0o644); err != nil {
-		return -1, err
-	}
+	finalConfig, finalState := rewritten, snapshotRoot.StateJSON
 
 	// Cgroup setup must use the resolved snapshot Capacity, not a host-only
 	// preflight value. memory.high remains max until the first trusted report.
-	cg, err := resctl.SetupCgroupForConfig(&snapCfg)
+	markRestore("runtime_files")
+	setupCgroup := resctl.SetupCgroupForConfig
+	if opts.PreparedRestore != nil {
+		setupCgroup = resctl.SetupPreparedCgroupForConfig
+	}
+	cg, err := setupCgroup(&snapCfg)
 	if err != nil {
 		return -1, fmt.Errorf("cgroup: %w", err)
 	}
@@ -462,6 +548,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// needed by Admit is available. A stalled manifest fetch must not appear
 	// to restart inventory as a live, full-capacity sandbox that cannot yet
 	// StateSync because it has never been admitted.
+	markRestore("cgroup_setup")
 	hooks, err := resctl.NewControllerHooks(resctl.ControllerHookOptions{
 		SocketPath: opts.HostCfg.Resources.Control.Controller,
 		CgroupPath: cg.LocalPath(),
@@ -494,13 +581,92 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// layer; a page hole in every layer (merged hole) → ZEROPAGE. Single layer
 	// (no from_refs) degenerates to today's behaviour. Parent streams were
 	// opened during preflight and live until run exit; selfStream is root-owned.
+	markRestore("reservation")
 	capBytes := snapCap
 	memLayers := make([]fetch.Stream, 1, 1+len(parentMemoryLayers))
 	memLayers[0] = selfStream
 	memLayers = append(memLayers, parentMemoryLayers...)
+	// Prefer existing authenticated plaintext template leases for immutable lower
+	// layers. Do not create new copies or force packed carriers into page cache.
+	if privateRAM && opts.CustomerKeyFn != nil && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" {
+		key, keyErr := opts.CustomerKeyFn()
+		if keyErr != nil {
+			return -1, keyErr
+		}
+		fingerprint := sha256.Sum256(key[:])
+		clear(key[:])
+		for i, ref := range memoryConfig.FromRefs {
+			cached, cacheErr := cachedComparisonMemory(ctx, opts.RuntimeRoot, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"), fmt.Sprintf("%s:%x:%d", ref, fingerprint, capBytes), capBytes)
+			if cacheErr != nil {
+				return -1, cacheErr
+			}
+			if cached != nil {
+				defer cached.Close()
+				memLayers[i+1] = cached
+			}
+		}
+	}
 	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
+	}
+	if privateRAM && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" && opts.CustomerKeyFn != nil {
+		key, keyErr := opts.CustomerKeyFn()
+		if keyErr != nil {
+			return -1, keyErr
+		}
+		fingerprint := sha256.Sum256(key[:])
+		clear(key[:])
+		allowed := append([]string{selfRef}, memoryConfig.FromRefs...)
+		memoryBinding.ComparisonMemory = func(ctx context.Context, ref string, size uint64) (fetch.Stream, error) {
+			for _, known := range allowed {
+				if known == ref {
+					return cachedComparisonMemory(ctx, opts.RuntimeRoot, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"), fmt.Sprintf("%s:%x:%d", ref, fingerprint, size), size)
+				}
+			}
+			return nil, nil
+		}
+	}
+	templateMemory := false
+	if privateRAM && len(parentMemoryLayers) == 0 && templateCoWConfig(snapshotRoot.ConfigJSON) && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" && opts.CustomerKeyFn != nil && opts.SnapshotRef != "" {
+		ref, parseErr := manifest.ParseRef(opts.SnapshotRef)
+		if parseErr != nil {
+			return -1, parseErr
+		}
+		if ref.Scheme == manifest.RefSchemeManifest || ref.Digest != "" {
+			key, keyErr := opts.CustomerKeyFn()
+			if keyErr != nil {
+				return -1, keyErr
+			}
+			fingerprint := sha256.Sum256(key[:])
+			clear(key[:])
+			started := time.Now()
+			var releaseTemplate func()
+			templateMemory, releaseTemplate, err = prepareTemplateMemoryLease(ctx, opts.RuntimeRoot, stateDir,
+				fmt.Sprintf("%s:%x:%d", opts.SnapshotRef, fingerprint, capBytes), source, capBytes, templateMemoryBudget, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"))
+			defer releaseTemplate()
+			if err != nil {
+				return -1, fmt.Errorf("prepare template memory: %w", err)
+			}
+			logf("template memory cache enabled=%t preparation=%s", templateMemory, time.Since(started))
+		}
+	}
+	if opts.PreparedRestore != nil && !templateMemory {
+		// Keep restore compatibility when the bounded memory cache is full or
+		// the snapshot has layered memory. Release only the empty holder;
+		// durable disks, validated sources and identity barriers are retained.
+		if err := opts.PreparedRestore.DiscardEmpty(); err != nil {
+			return -1, err
+		}
+		opts.PreparedRestore = nil
+		logf("prepared restore holder released: using ordinary on-demand restore")
+	}
+	if privateRAM && !templateMemory {
+		closePager, err := startPrivatePager(ctx, stateDir, source, capBytes)
+		if err != nil {
+			return -1, err
+		}
+		defer closePager()
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
 	prefetch := startMemoryPrefetch(ctx, prefetchMode, opts.SnapshotManifestKey, root.stream, len(memLayers)-1, logf)
@@ -508,6 +674,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// memory-layer Close defer so cancellation and join always run first.
 	defer prefetch.Stop()
 
+	markRestore("memory_source")
 	cacheSize, maxDirtySize, err := snapCfg.Resources.DiffCOW.Bytes()
 	if err != nil {
 		return -1, err
@@ -527,7 +694,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 	}()
 	defer stopCache()
-	disks, cleanupDisks, err := reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache)
+	markRestore("disk_cache")
+	disks, cleanupDisks, reusedBackends, err := opts.PreparedSources.takeSlotBackends(ctx, cowCache)
+	if err == nil && !reusedBackends {
+		disks, cleanupDisks, err = reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache)
+	}
 	if err != nil {
 		return -1, err
 	}
@@ -537,6 +708,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
+	markRestore("disk_reconstruct")
+
+	waitRetention := func() error { return nil }
 	if opts.CurrentRun != nil {
 		if !opts.EnableCheckpoint || opts.CurrentRun.SandboxID != opts.SandboxID {
 			return -1, errors.New("current disk retention requires checkpoint mode and matching sandbox identity")
@@ -557,9 +731,36 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			capacities[i] = disk.Cow.Size()
 		}
 		provenance := sandbox.RunOptions{SourceBinding: &sandbox.RunSourceBinding{SandboxRef: sandboxSource.PortableRef, RuntimeRef: sandboxSource.RuntimeRef, RelativeDir: sandboxSource.RelativeDir, BundleSource: firstBundleSource(sandboxSource.bundleSource, bundleSource)}, BundleReader: firstBundleReader(sandboxSource.bundleReader, root.bundleReader), BundleFetcher: firstBundleFetcher(sandboxSource.bundleFetcher, root.bundleFetcher), Fetcher: opts.Fetcher}
-		err = sandbox.RetainCurrentDiskPlan(ctx, storage, opts.checkpointOwner, opts.CurrentRun, &snapCfg, c0, sandboxSource.PortableRef, opts.checkpointPlan, capacities, opts.RefLocations, provenance)
-		err = errors.Join(err, storage.Close())
-		if err != nil {
+		// The VMM remains paused until PostSpawn joins this persistence
+		// barrier. Independent device restoration can overlap durable graph
+		// publication; no guest write or Ready escapes before it completes.
+		retentionCtx := ctx
+		if p := opts.PreparedSources; p != nil && p.taken && p.slotPlan != nil && p.slotPlan.adopted {
+			// Matches already checked exact source, locations, key and policy.
+			// Keep that same borrowed capability for prepared dependency proofs.
+			if err := storage.Close(); err != nil {
+				return -1, err
+			}
+			storage = p.storage.BorrowWithFetcher(opts.Fetcher)
+			retentionCtx = artifact.WithPreparedCurrentDependencies(ctx, p.slotPlan.currentDependencies)
+		}
+		retentionCfg := snapCfg
+		retain := func() error {
+			started := time.Now()
+			e := sandbox.RetainCurrentDiskPlan(retentionCtx, storage, opts.checkpointOwner, opts.CurrentRun, &retentionCfg, c0, sandboxSource.PortableRef, opts.checkpointPlan, capacities, opts.RefLocations, provenance)
+			e = errors.Join(e, storage.Close())
+			logf("current disk graph persistence completed duration=%s error=%v", time.Since(started), e)
+			return e
+		}
+		if opts.PreparedRestore != nil {
+			waitRetention = beginPersistence(retain)
+			defer func() {
+				retErr = errors.Join(retErr, waitRetention())
+				if retErr != nil {
+					code = -1
+				}
+			}()
+		} else if err := retain(); err != nil {
 			return -1, err
 		}
 	}
@@ -572,24 +773,96 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// NetworkSpec the guest re-applies flush-and-replace (clone takes a fresh
 	// L3 identity; the MAC stays the snapshot's, so the provider must use a
 	// stable per-port MAC — see https://github.com/kuasar-sandbox/connector/blob/main/docs/tapfd.md#lifetime-and-idempotency).
+	// Gate both named and provider TAPs through guest identity renewal.
+	restoredNetID := "_net0"
+	markRestore("retention_launch")
+	var forkGate *tapfd.ForkGate
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
+	namedProviderLease := false
 	if snapCfg.Network.TapFD != nil {
-		f, nsf, meta, err := tapfd.AcquireConfig(ctx, snapCfg.Network.TapFD)
+		var f, nsf *os.File
+		var meta tapfd.Metadata
+		var reused bool
+		if privateRAM && opts.PreparedRestore != nil {
+			var name string
+			name, nsf, meta, forkGate, reused = opts.PreparedRestore.TakePreparedNamedTap(snapCfg.Network.TapFD)
+			if !reused {
+				return -1, errors.New("prepared restore provider capability does not match assigned lease")
+			}
+			snapCfg.Network.TAP, snapCfg.Network.TapFD = name, nil
+			namedProviderLease = true
+			defer forkGate.Close()
+		}
+		var err error
+		if !reused {
+			f, nsf, meta, err = tapfd.AcquireConfig(ctx, snapCfg.Network.TapFD)
+		}
 		if err != nil {
 			return -1, fmt.Errorf("tapfd handoff: %w", err)
 		}
 		tapFile = f
-		defer tapFile.Close()
+		if tapFile != nil {
+			defer tapFile.Close()
+		}
 		netnsFile = nsf // non-nil only if the provider's tap is netns-isolated
 		if netnsFile != nil {
 			defer netnsFile.Close()
 		}
+
 		metaMAC, metaIP = meta.MAC, meta.IP
-		logf("tapfd: received tap fd for restore (mac=%s ip=%s netns=%t)", meta.MAC, meta.IP, netnsFile != nil)
+		logf("tapfd: received tap fd for restore (mac=%s ip=%s netns=%t prepared=%t)", meta.MAC, meta.IP, netnsFile != nil, reused)
+	}
+	markRestore("tap_acquire")
+	exclusiveProviderLease := tapFile != nil || namedProviderLease
+	if privateRAM && tapFile != nil {
+		name, err := tapfd.PersistentName(tapFile)
+		if err != nil {
+			return -1, err
+		}
+		if err = tapFile.Close(); err != nil {
+			return -1, err
+		}
+		tapFile = nil
+		snapCfg.Network.TAP = name
+		snapCfg.Network.TapFD = nil
 	}
 	netMAC, netSpec := snapCfg.Network.Effective(metaMAC, metaIP)
+	// A private-RAM resume reopens a named TAP, so it must replace the
+	// historical snapshot device with the current provider lease too. Otherwise
+	// it can attach a released port while the allocator reserves a different one.
+	if (opts.ForkNetworkIdentity || (privateRAM && exclusiveProviderLease)) && (snapCfg.Network.TAP != "" || snapCfg.Network.TapFD != nil) {
+		if netSpec == nil {
+			return -1, fmt.Errorf("fork network requires a child IP")
+		}
+		netSpec.MAC = netMAC
+		restoredNetID, err = forkNetworkID(snapshotRoot.ConfigJSON)
+		if err != nil {
+			return -1, err
+		}
+		childConfig, childState, err := rewriteForkNetworkPrepared(rewritten, snapshotRoot.StateJSON, snapCfg.Network.TAP, netMAC, tapFile != nil, preparedNetwork, exclusiveProviderLease)
+		if err != nil {
+			return -1, fmt.Errorf("fork network: %w", err)
+		}
+		markRestore("network_bytes_ready")
+		// Validate the allocated child identity/state before touching any provider link.
+		if forkGate != nil {
+			err = forkGate.Hold() // Recheck device identity and gate before restore.
+		} else if tapFile != nil {
+			forkGate, err = tapfd.GateForAssignedRestore(tapFile, netnsFile)
+		} else if exclusiveProviderLease {
+			forkGate, err = tapfd.GateNamedForAssignedRestore(snapCfg.Network.TAP, netnsFile)
+		} else {
+			forkGate, err = tapfd.GateNamedForFork(snapCfg.Network.TAP, netnsFile)
+		}
+		if err != nil {
+			return -1, fmt.Errorf("fork TAP gate: %w", err)
+		}
+		defer forkGate.Close()
+		finalConfig, finalState = childConfig, childState
+	}
 
+	markRestore("network_device_gated")
 	// The shared back-half (memfd, uffd va_report handler, vhost-blk
 	// backends, the launch server — incl. the guest→host mem_report /
 	// app_exited channel that was missing on the restore path — pinger,
@@ -599,9 +872,34 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// restore, so WireLaunchMUX=false — the stdio MUX is re-established
 	// by PostSpawn over the reverse channel), and a settle protocol of
 	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
+	if preparedNetwork != nil {
+		preparedNetwork.Wait()
+		preparedNetwork.state = nil // only the written child state is needed by the VM
+	}
+	linked, err := opts.PreparedSources.publishSlotState(stateDir, finalConfig, finalState)
+	if err != nil {
+		return -1, err
+	}
+	if !linked {
+		if err := os.WriteFile(filepath.Join(stateDir, "config.json"), finalConfig, 0644); err != nil {
+			return -1, err
+		}
+		if err := os.WriteFile(filepath.Join(stateDir, "state.json"), finalState, 0644); err != nil {
+			return -1, err
+		}
+
+	}
+	markRestore("network_state_published")
+	// CH now owns the on-disk launch state. Retain memory/disk source handles,
+	// but not per-instance copies of preparation-only JSON throughout its life.
+	opts.PreparedSources.releaseLaunchMetadata()
+	snapshotRoot.ConfigJSON, snapshotRoot.StateJSON = nil, nil
+	markRestore("network_rewrite_gate")
+	flushRestore() // keep instrumentation inside the measured readiness path
 	return sandbox.ServeAndWait(sandbox.VMParams{
-		BaseDir:     sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
-		DiskStorage: opts.storage, DiskCache: cowCache, DiskCurrentRun: opts.CurrentRun, DiskPlan: opts.checkpointPlan,
+		PrivateRAMFork: privateRAM,
+		BaseDir:        sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
+		DiskStorage:    opts.storage, DiskCache: cowCache, DiskCurrentRun: opts.CurrentRun, DiskPlan: opts.checkpointPlan,
 		EnableCheckpoint:   opts.EnableCheckpoint,
 		CheckpointOwner:    opts.checkpointOwner,
 		Balloon:            balloonCtl,
@@ -651,17 +949,40 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		Cgroup:          cg,
 		NotifyReadiness: opts.NotifyReadiness,
 
+		StartPreparedCH: func() func(context.Context) (*exec.Cmd, error) {
+			if opts.PreparedRestore == nil {
+				return nil
+			}
+			return func(ctx context.Context) (*exec.Cmd, error) {
+				if !privateRAM || !templateMemory {
+					return nil, errors.New("prepared restore requires private CoW template memory")
+				}
+				return opts.PreparedRestore.Restore(ctx, runDir, stateDir)
+			}
+		}(),
 		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
 			// CH 51 `--restore source_url=file://<dir>` replaces
 			// --kernel/--vsock; --console/--serial are restored from the
 			// snapshot bundle (taken with `--console tty --serial off`),
 			// so we don't repeat them. consoleArg is unused here.
 			cmd := exec.CommandContext(sandbox.VMLifecycleContext(ctx), opts.CHBinary)
-			_, cleanup, err := opts.StdioMode.SetupCHStdio(cmd)
-			if err != nil {
-				return nil, nil, fmt.Errorf("stdio: %w", err)
-			}
+			cleanup := func() {}
+			if opts.PreparedRestore == nil {
+				var err error
+				_, cleanup, err = opts.StdioMode.SetupCHStdio(cmd)
+				if err != nil {
+					return nil, nil, fmt.Errorf("stdio: %w", err)
+				}
+			} // A prepared child already owns its journal streams.
 			restoreArg := "source_url=file://" + stateDir
+			if privateRAM {
+				cmd.Args = append(cmd.Args, "--enable-fork")
+				if templateMemory {
+					restoreArg += ",memory_restore_mode=copyonwrite"
+				} else {
+					restoreArg += ",memory_restore_mode=ondemand"
+				}
+			}
 			if e.TapFDNum > 0 {
 				// CH can't serialize fds, so the snapshot's net fd is dead;
 				// re-bind the fresh tap queue fd (CH fd 4) to the restored net
@@ -669,7 +990,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				// net_fds is a CH Tuple<String,Vec<u64>>: the whole value is
 				// bracket-wrapped, each entry is <net-id>@<fd-list>. Single
 				// net _net0 with one fd → [_net0@[N]].
-				restoreArg += fmt.Sprintf(",net_fds=[_net0@[%d]]", e.TapFDNum)
+				restoreArg += fmt.Sprintf(",net_fds=[%s@[%d]]", restoredNetID, e.TapFDNum)
 			}
 			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
 			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)
@@ -684,27 +1005,76 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		// non-nil return aborts the run (ServeAndWait kills CH); we
 		// don't hand back a sandbox whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
-			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
+			postStarted := time.Now()
+			if opts.PreparedRestore != nil {
+				if !opts.PreparedRestore.RestoreAcknowledged(runDir) {
+					return errors.New("prepared restore has no synchronous paused acknowledgement")
+				}
+			} else if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
-			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
-				return fmt.Errorf("vm.resume: %w", err)
+			if forkGate != nil {
+				if err := forkGate.Hold(); err != nil {
+					return fmt.Errorf("fork TAP hold before resume: %w", err)
+				}
 			}
-			pc.Logf("VM resumed, vCPU running")
-
+			pc.Logf("[restore ready gate] start_ns=%d end_ns=%d", postStarted.UnixNano(), time.Now().UnixNano())
+			var initialization *guestlink.RestoreInitialization
+			if len(opts.RestoreEnvdInit) > 0 {
+				initialization = &guestlink.RestoreInitialization{Body: opts.RestoreEnvdInit}
+			}
+			retentionWaitStarted := time.Now()
 			tRestore := time.Now()
-			// 0 = no forced timeout: DialRaw needs a finite value, so fall back
-			// to noForcedTimeout (effective-infinity; cancellation still flows
-			// via pc.Ctx → CH teardown closing the vsock conn).
 			restoreDeadline := opts.HostCfg.RestoreDeadline()
 			if restoreDeadline <= 0 {
 				restoreDeadline = config.NoForcedTimeout
 			}
-			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
-				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, restoreDeadline)
-			}, pc.EstablishMUX, pc.NotifyReady)
+			conn, restoredSpec, err := resumeAndConnect(pc.Ctx, waitRetention,
+				func(resumeCtx context.Context, submitted func()) error {
+					pc.Logf("restore persistence barrier joined wait=%s", time.Since(retentionWaitStarted))
+					err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeSubmittedContext(resumeCtx, submitted)
+					if err == nil {
+						pc.Logf("VM resumed, vCPU running")
+						if len(opts.Forwards) > 0 && pc.PreconnectForward != nil {
+							pc.PreconnectForward(pc.Ctx)
+						}
+					}
+					return err
+				}, func(connectCtx context.Context) (net.Conn, proto.StdioSpec, error) {
+					if opts.ForkNetworkIdentity {
+						return guestlink.OpenMUXViaForkContext(connectCtx, pc.Pinger.Client, 1, netSpec, restoreDeadline, initialization)
+					}
+					return guestlink.OpenMUXViaRestoreContext(connectCtx, pc.Pinger.Client, 1, netSpec, restoreDeadline, initialization)
+				})
+			if err != nil {
+				return fmt.Errorf("restore persistence/resume/connect barrier: %w", err)
+			}
+			notifyReady := pc.NotifyReady
+			if forkGate != nil || initialization != nil {
+				notifyReady = nil
+			}
+			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) { return conn, restoredSpec, nil }, pc.EstablishMUX, notifyReady)
 			if err != nil {
 				return err
+			}
+			if initialization != nil {
+				if !initialization.Confirmed {
+					if err := initializeEnvdOverUDS(pc.Ctx, opts.RestoreEnvdSocket, opts.RestoreEnvdInit); err != nil {
+						return err
+					}
+				}
+				pc.Logf("restore envd initialized inline=%t", initialization.Confirmed)
+			}
+			if forkGate != nil {
+				if err := forkGate.Release(); err != nil {
+					return fmt.Errorf("fork TAP release: %w", err)
+				}
+				if pc.NotifyReady != nil {
+					pc.NotifyReady()
+				}
+			}
+			if forkGate == nil && initialization != nil && pc.NotifyReady != nil {
+				pc.NotifyReady()
 			}
 			pc.Logf("restore notify acked in %dµs (stdio MUX re-established: tty=%v); starting ping ticker",
 				time.Since(tRestore).Microseconds(), muxSpec.TTY)
@@ -851,6 +1221,33 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	}
 	db.Overlay = !single
 
+	// The immutable EROFS carrier and writable CoW branch are independent.
+	// Keep both behind the same completion barrier and join/close the speculative
+	// reader on every early failure; no I/O goroutine outlives disk cleanup.
+	var immutableReader diffstore.BlockReader
+	var immutableErr error
+	var immutableDone chan struct{}
+	if !single {
+		immutableDone = make(chan struct{})
+		immutableCtx, cancelImmutable := context.WithCancel(ctx)
+		go func() {
+			defer close(immutableDone)
+			var reused bool
+			immutableReader, reused, immutableErr = opts.PreparedSources.takeImage(immutableCtx, erofsBaseURI, opts.ArtifactRelativeDir)
+			if !reused {
+				immutableReader, _, immutableErr = openEROFSBlockReader(immutableCtx, erofsBaseURI, opts)
+			}
+		}()
+		closers = append(closers, func() error {
+			cancelImmutable()
+			<-immutableDone
+			if immutableReader != nil {
+				return immutableReader.Close()
+			}
+			return nil
+		})
+	}
+
 	// Layered ro base: [captured top] ++ chain.
 	logf("disk %s image: opening captured top", diskKey)
 	refs := append([]string{capturedTop}, chain...)
@@ -900,7 +1297,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		found := false
 		for _, binding := range opts.checkpointPlan.Disks {
 			if binding.Path == diffPath {
-				cowOptions = append(cowOptions, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID))
+				cowOptions = append(cowOptions, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID), diffstore.WithDurableFlush())
 				found = true
 				break
 			}
@@ -925,12 +1322,11 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 
 	// Overlay mode: the ro erofs base device.
 	if !single {
-		r, _, rerr := openEROFSBlockReader(ctx, erofsBaseURI, opts)
-		if rerr != nil {
-			return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, rerr))
+		<-immutableDone
+		if immutableErr != nil {
+			return fail(fmt.Errorf("%s: open erofs base: %w", diskKey, immutableErr))
 		}
-		db.Reader, db.BasePath = r, erofsBaseURI
-		closers = append(closers, r.Close)
+		db.Reader, db.BasePath = immutableReader, erofsBaseURI
 	}
 	return db, cleanup, nil
 }
@@ -1002,6 +1398,9 @@ func openEROFSBlockReader(ctx context.Context, raw string, opts Options) (diffst
 // .sandbox is narrowed to Payload by sandbox.OpenDiskStreamAtWithOpener; its
 // runtime config is never adopted recursively.
 func openDiskRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream, error) {
+	if stream := borrowSandboxPayload(raw, opts); stream != nil {
+		return stream, nil
+	}
 	opener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		opened, err := opts.openFile(ctx, path, ref)
 		if err != nil {
@@ -1283,11 +1682,17 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 	return source, nil
 }
 
-func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) error {
+func preflightRestoreDiskGraphUncached(ctx context.Context, cfg *config.SandboxConfig, opts Options, relativeDir string, diffCustomerKey [32]byte) (retErr error) {
 	if cfg == nil {
 		return errors.New("nil restored Sandbox config")
 	}
 	opts.ArtifactRelativeDir = relativeDir
+	// Retain each immutable layer once for both size and ext4 checks. Borrowers
+	// close only their view; all owned descriptors close before preflight returns.
+	layers := newPreflightLayers(func(raw string) (fetch.Stream, error) {
+		return openDiskRefStream(ctx, raw, opts)
+	})
+	defer func() { retErr = errors.Join(retErr, layers.Close()) }()
 	seen := make(map[string]uint64)
 	seenImages := make(map[string]uint64)
 	open := func(field, raw string) (uint64, error) {
@@ -1297,7 +1702,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		if size, ok := seen[raw]; ok {
 			return size, nil
 		}
-		stream, err := openDiskRefStream(ctx, raw, opts)
+		stream, err := layers.Open(raw)
 		if err != nil {
 			return 0, fmt.Errorf("%s: %w", field, err)
 		}
@@ -1358,7 +1763,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			return nil, cause
 		}
 		for i, raw := range refs {
-			stream, err := openDiskRefStream(ctx, raw, opts)
+			stream, err := layers.Open(raw)
 			if err != nil {
 				return fail(fmt.Errorf("%s layer[%d]: %w", field, i, err))
 			}
@@ -1411,7 +1816,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			found := false
 			for _, binding := range opts.checkpointPlan.Disks {
 				if binding.Path == diffPath {
-					cowOptions = append(cowOptions, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID))
+					cowOptions = append(cowOptions, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID), diffstore.WithDurableFlush())
 					found = true
 					break
 				}
@@ -1649,4 +2054,14 @@ func fileSnapshotRef(path, rawRef, scheme, digest string, codec tarstream.Codec)
 		return "", err
 	}
 	return ref.String(), nil
+}
+
+// CPU is for the entire process, including unrelated goroutines. It is not
+// attributed to the current task or to the OS thread sampled at this boundary.
+func restoreProcessCPU() int64 {
+	var t unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_PROCESS_CPUTIME_ID, &t) != nil {
+		return -1
+	}
+	return t.Nano()
 }

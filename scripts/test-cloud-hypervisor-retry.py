@@ -25,6 +25,9 @@ class CargoRetryTests(unittest.TestCase):
         (self.source / "Cargo.lock").write_text(
             'version = 4\n\n[[package]]\nname = "cloud-hypervisor"\nversion = "0.0.0"\n')
         (self.source / "src/main.rs").write_text('fn main() { println!("offline CH recipe fixture"); }\n')
+        subprocess.run(["git", "init", "-q", str(self.source)], check=True)
+        subprocess.run(["git", "-C", str(self.source), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.source), "-c", "user.name=fixture", "-c", "user.email=fixture@local", "commit", "-qm", "fixture"], check=True)
         tools = self.root / "tools"
         tools.mkdir()
         wrapper = tools / "cp"
@@ -60,6 +63,18 @@ os.execv(os.environ["CH_FIXTURE_REAL_CP"], [os.environ["CH_FIXTURE_REAL_CP"], *s
         self.assertTrue(any(row.get("reason") == "compiler-artifact"
                             and row.get("target", {}).get("name") == "cloud-hypervisor"
                             for row in report))
+
+    def test_source_and_untracked_inputs_invalidate_complete_binary(self):
+        self.assert_materials(self.build())
+        original = self.binary.read_bytes()
+        (self.source / "src/main.rs").write_text('fn main() { println!("changed source"); }\n')
+        self.assert_materials(self.build())
+        self.assertNotEqual(original, self.binary.read_bytes())
+        stamp = self.binary.with_name("cloud-hypervisor.inputs.sha256")
+        before = stamp.read_text()
+        (self.source / "new-module.rs").write_text("// new input\n")
+        self.assert_materials(self.build())
+        self.assertNotEqual(before, stamp.read_text())
 
     def test_real_cargo_relinks_after_successful_compile_failed_to_publish(self):
         failed = self.build(fail=True)

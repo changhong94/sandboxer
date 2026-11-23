@@ -97,6 +97,10 @@ type PostSpawnCtx struct {
 // callers (sandbox.Run / restore.Run) keep their own thin front-half
 // (config resolution, cgroup, controller admit) and converge here.
 type VMParams struct {
+	// AttachCH waits for the authenticated private-RAM fork handoff after the
+	// disk/guest-control listeners are live. No replacement VM is booted.
+	AttachCH           func(context.Context) (*InheritedCH, error)
+	PrivateRAMFork     bool
 	DiskStorage        *artifact.ProcessStorage
 	DiskCache          *diffstore.Cache
 	DiskCurrentRun     *artifact.CurrentRun
@@ -232,6 +236,7 @@ type SnapDiskRef struct {
 	ListCheckpoints   func(context.Context) ([]string, error)
 	WaitMaterialized  func(context.Context) error
 	Export            func(context.Context) (snapshot.ExportView, error)
+	OpenCheckpoint    func(context.Context, string) (snapshot.ExportView, error)
 	DiffPath          string
 	OwnedDiff         bool
 	Size              int64
@@ -252,6 +257,12 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if p.owner == nil {
 		p.owner, _ = p.Ctx.Value(runtimeOwnerKey{}).(*Runtime)
 	}
+	if p.owner != nil && p.PrivateRAMFork {
+		p.owner.mu.Lock()
+		p.owner.spec.PrivateRAMFork = true
+		p.owner.spec.EnableCheckpoint = p.owner.spec.EnableCheckpoint || p.EnableCheckpoint
+		p.owner.mu.Unlock()
+	}
 	if err := p.Ctx.Err(); err != nil {
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
@@ -264,7 +275,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return firstReadFatal
 	}
 	var chProcessMu sync.RWMutex
-	var chProcess *os.Process
+	var chProcess processSignaler
 	logf := p.Logf
 	var usageManager *usage.Manager
 	var usageSampler *usage.Sampler
@@ -338,7 +349,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		process := chProcess
 		chProcessMu.RUnlock()
 		if process != nil {
-			_ = process.Kill()
+			_ = process.Signal(syscall.SIGKILL)
 		}
 		logf("sandbox fatal I/O: %v", cause)
 	}
@@ -470,11 +481,40 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	var snapDisks []SnapDiskRef // per logical disk: writable diff for snapshot
 	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool) error {
 		s := vhost.NewServer(sock, backend, logf)
-		if vhost.DynamicSlot(backend) {
+		if p.PrivateRAMFork {
+			id := fmt.Sprintf("_disk%d", len(devs))
+			s.SetNativeCapacityNotify(func() error {
+				return (chapi.Client{Sock: chSock, RespDeadline: p.SnapCfg.CHApiDeadline()}).ResizeDisk(p.Ctx, id, uint64(backend.Size()))
+			})
+			// Checkpoint disk construction enables durable guest FLUSH before
+			// binding; immutable base Flush is a no-op by definition.
+			if err := s.EnableNativeExport(backend.Flush); err != nil {
+				return err
+			}
+			if err := s.Listen(); err != nil {
+				return err
+			}
+			servers = append(servers, s)
+			devs = append(devs, servedDevice{sock: sock, readonly: ro})
+			return nil
+		}
+
+		// Read-only frontends keep notification negotiation across snapshot restore,
+		// even after a generic root acquired its final geometry.
+		if ro || vhost.DynamicSlot(backend) {
 			s.EnableCapacityChange()
 		}
 		s.SetReadFatal(reportReadFatal)
 		s.SetDirtyTracker(dirty.Mark)
+		s.SetBeforeWrite(func(off, length uint64) error {
+			uffdHandlerMu.Lock()
+			h := uffdHandler
+			uffdHandlerMu.Unlock()
+			if h == nil {
+				return fmt.Errorf("capture: UFFD handler unavailable")
+			}
+			return h.BeforeBackendWrite(off, length)
+		})
 		s.SetMemoryLoader(func(ctx context.Context, off, length uint64) error {
 			select {
 			case <-ctx.Done():
@@ -697,7 +737,20 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	snapDisks = bindCheckpointDisks(snapDisks, p.Disks)
 	dirtyCollector := chapi.NewDirtyMemoryCollector(chapi.Client{Sock: chSock, RespDeadline: p.SnapCfg.CHApiDeadline()}, uint64(memfd.Size()))
 	snapHandler := &SnapshotHandler{
+		PrivateRAMFork: p.PrivateRAMFork,
+		BeginLiveMemory: func(ctx context.Context, view *memory.CaptureView) (*memory.CoWCapture, error) {
+			uffdHandlerMu.Lock()
+			h := uffdHandler
+			uffdHandlerMu.Unlock()
+			if h == nil {
+				return nil, fmt.Errorf("capture: UFFD handler unavailable")
+			}
+			return h.BeginLiveCapture(memfdCaptureReader{memfd.FD()}, view)
+		},
 		CaptureMemory: func(ctx context.Context) (*memory.CaptureView, error) {
+			if p.PrivateRAMFork {
+				return nil, fmt.Errorf("private RAM capture adapter is not installed")
+			}
 			report, supported, err := dirtyCollector.Collect(ctx)
 			if err != nil {
 				return nil, err
@@ -984,8 +1037,16 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			if err := forwarder.Start(backendCtx, spec.Forwards); err != nil {
 				return err
 			}
+			if r.spec.Disks[0].LateBindBase && !servers[0].CanNotifyCapacity() {
+				return errors.New("late-bound root: VMM capacity notification unavailable")
+			}
 			if err := r.deviceSet.Bind(backends); err != nil {
 				return err
+			}
+			if r.spec.Disks[0].LateBindBase {
+				if err := servers[0].NotifyCapacity(); err != nil {
+					return fmt.Errorf("late-bound root notification: %w", err)
+				}
 			}
 			index := 0
 			for _, d := range disks {
@@ -1134,18 +1195,39 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		backendWG.Wait()
 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
 	}
-	if err := startCH(cmd, p.NetnsFile); err != nil {
-		cancelBackends()
-		backendWG.Wait()
-		return -1, fmt.Errorf("spawn CH: %w", err)
+	var inherited *InheritedCH
+	var process processSignaler
+	chPid := 0
+	if p.AttachCH != nil {
+		if !p.PrivateRAMFork {
+			return -1, fmt.Errorf("inherited CH requires private RAM")
+		}
+		inherited, err = p.AttachCH(backendCtx)
+		if err != nil {
+			return -1, fmt.Errorf("inherit CH: %w", err)
+		}
+		if inherited == nil {
+			return -1, fmt.Errorf("inherit CH returned no owner")
+		}
+		defer inherited.Close()
+		process = inherited
+		chPid = inherited.PID
+	} else {
+		if err := startCH(cmd, p.NetnsFile); err != nil {
+			cancelBackends()
+			backendWG.Wait()
+			return -1, fmt.Errorf("spawn CH: %w", err)
+		}
+		process = cmd.Process
+		chPid = cmd.Process.Pid
 	}
+
 	chProcessMu.Lock()
-	chProcess = cmd.Process
+	chProcess = process
 	chProcessMu.Unlock()
 	if readFatal() != nil {
-		_ = cmd.Process.Kill()
+		_ = process.Signal(syscall.SIGKILL)
 	}
-	chPid := cmd.Process.Pid
 	logf("CH started pid=%d", chPid)
 	if usageSampler != nil {
 		usageSampler.Start(backendCtx, chPid)
@@ -1154,26 +1236,38 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	// failed restore setup. WNOWAIT keeps native process counters readable.
 	doneCh := make(chan error, 1)
 	go func() {
-		var info unix.Siginfo
-		waitIDErr := observeCHExit(func() error {
-			return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
-		}, func() {
+		var waitErr error
+		if inherited != nil {
+			waitErr = inherited.Wait()
 			chExitObserved.Store(true)
-			if p.owner != nil {
-				// WNOWAIT only observes the child. Do not cancel the CommandContext
-				// before cmd.Wait reaps it, or a normal CH exit is rewritten to
-				// context.Canceled. Mark the owner closing; stopForExit runs after Wait.
-				p.owner.markExiting()
+			// A pidfd reports exit, not the non-child wait status. Do not
+			// invent a successful workload exit when no shutdown was requested.
+			if waitErr == nil && !runShutdownRequested(p.Ctx) {
+				waitErr = fmt.Errorf("inherited VMM exited without requested shutdown; exit status unavailable")
 			}
-		}, func(ctx context.Context) {
-			if usageSampler != nil {
-				usageSampler.FinalCH(ctx)
+		} else {
+			var info unix.Siginfo
+			waitIDErr := observeCHExit(func() error {
+				return unix.Waitid(unix.P_PID, chPid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+			}, func() {
+				chExitObserved.Store(true)
+				if p.owner != nil {
+					// WNOWAIT only observes the child. Do not cancel the CommandContext
+					// before cmd.Wait reaps it, or a normal CH exit is rewritten to
+					// context.Canceled. Mark the owner closing; stopForExit runs after Wait.
+					p.owner.markExiting()
+				}
+			}, func(ctx context.Context) {
+				if usageSampler != nil {
+					usageSampler.FinalCH(ctx)
+				}
+			})
+			if waitIDErr != nil {
+				logf("CH exit waitid: %v", waitIDErr)
 			}
-		})
-		if waitIDErr != nil {
-			logf("CH exit waitid: %v", waitIDErr)
+			waitErr = cmd.Wait()
 		}
-		waitErr := cmd.Wait()
+
 		if p.owner != nil {
 			p.owner.stopForExit()
 		}
@@ -1193,7 +1287,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	pinger.SetOnFatal(func(err error) {
 		logf("pinger fatal threshold (%d) hit: %v — SIGTERMing CH pid=%d",
 			pinger.Cfg.FatalThreshold, err, chPid)
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = process.Signal(syscall.SIGTERM)
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
@@ -1209,7 +1303,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		NotifyReady:  notifyReady,
 	}); err != nil {
 		if readFatal() != nil || !runShutdownRequested(p.Ctx) {
-			_ = cmd.Process.Kill()
+			_ = process.Signal(syscall.SIGKILL)
 			<-doneCh
 			cancelBackends()
 			backendWG.Wait()
@@ -1224,7 +1318,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		logf("post-spawn interrupted by shutdown: %v", err)
 	}
 
-	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
+	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, process, chPid, chSock, cgroupPath, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
 	cancelBackends()
 	backendWG.Wait()
 	exit := 0
@@ -1308,4 +1402,15 @@ func logicalDiskCount(p VMParams) int {
 		return len(p.owner.spec.Disks)
 	}
 	return len(p.Disks)
+}
+
+// Borrowed pread reader: the lifecycle owns the memfd until capture completion.
+type memfdCaptureReader struct{ fd int }
+
+func (r memfdCaptureReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := syscall.Pread(r.fd, p, off)
+	if err == nil && n < len(p) {
+		err = io.EOF
+	}
+	return n, err
 }

@@ -45,9 +45,13 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
+	PrivateRAMFork           bool
+	preparedFallback         bool
+	preparedRuntime          *Runtime // exclusive RunPrepared owner; never serialized
 	memoryLayout             snapshot.MemoryLayout
 	memoryLogf               func(string, ...any)
 	captureMemory            func(context.Context) (*memory.CaptureView, error)
+	beginLiveMemory          func(context.Context, *memory.CaptureView) (*memory.CoWCapture, error)
 	EnableCheckpoint         bool
 	CurrentRun               *artifact.CurrentRun
 	checkpointPlan           *CheckpointDiskPlan
@@ -115,11 +119,12 @@ type RunSourceBinding struct {
 // MemorySourceBinding is restore-only, non-serializable lookup/provenance for
 // the current S. Disk state is intentionally absent: it belongs to C0/E.
 type MemorySourceBinding struct {
-	SnapshotRef  string
-	RuntimeRef   string
-	RelativeDir  string
-	FromRefs     []string
-	BundleSource *BundleSourceBinding
+	ComparisonMemory func(context.Context, string, uint64) (fetch.Stream, error)
+	SnapshotRef      string
+	RuntimeRef       string
+	RelativeDir      string
+	FromRefs         []string
+	BundleSource     *BundleSourceBinding
 }
 
 // BundleSourceBinding keeps physical Bundle lookup separate from logical
@@ -141,6 +146,12 @@ type BundleSourceBinding struct {
 // Workload preflight still precedes VM startup. Start/Launch reuse its sealed
 // metadata only for the same inputs and validate the live backends on open.
 func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
+	phaseStart := time.Now()
+	phase := func(name string) {
+		now := time.Now()
+		log.Printf("[sandbox-ctl] run stage=%s duration=%s", name, now.Sub(phaseStart))
+		phaseStart = now
+	}
 	if opts.Cfg == nil {
 		return -1, fmt.Errorf("RunOptions.Cfg is nil")
 	}
@@ -192,6 +203,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	phase("checkpoint_prepare")
 	defer func() { retErr = errors.Join(retErr, checkpointRelease()) }()
 	var diffCustomerKey [32]byte
 	if opts.LocalCodec != nil {
@@ -247,6 +259,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err := canonicalizeConfiguredTarRefsWithOpener(ctx, opts.Cfg, opts.RefLocations, opts.LocalCodec, opts.LocalRequired, fileOpener); err != nil {
 		return -1, fmt.Errorf("portable disk refs: %w", err)
 	}
+	phase("canonicalize")
 	needsManifest := needsManifestFetcher(opts.Cfg)
 	if needsManifest {
 		if opts.Fetcher == nil {
@@ -273,6 +286,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	phase("artifact_preflight")
 	if !legacyPortableBoot {
 		if err := MaterializeImageDefaults(opts.Cfg, preparation.imageDefaults); err != nil {
 			return -1, fmt.Errorf("materialize image defaults: %w", err)
@@ -287,6 +301,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	phase("host_identity")
 	hostIdentity.sourceCold = legacyPortableBoot
 	if !legacyPortableBoot {
 		c0, err = config.ProjectPortableCold(opts.Cfg, hostIdentity.projection)
@@ -317,12 +332,14 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	phase("derive_shape")
 	shape.SandboxID = opts.SandboxID
 	shape.PathID = opts.PathID
 	shape.CHBinary = opts.CHBinary
 	shape.RuntimeRoot = opts.RuntimeRoot
 	shape.BaseRoot = opts.BaseRoot
 	shape.EnableCheckpoint = opts.EnableCheckpoint
+	shape.PrivateRAMFork = opts.PrivateRAMFork
 	shape.CurrentRun = opts.CurrentRun
 	shape.checkpointPlan = opts.checkpointPlan
 	shape.checkpointOwner = opts.checkpointOwner
@@ -334,13 +351,33 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.NotifyReadiness = opts.NotifyReadiness
 	shape.logf = func(f string, a ...any) { log.Printf("[sandbox-ctl] "+f, a...) }
 	shape.preparedHost = &hostIdentity
+	if opts.preparedRuntime != nil {
+		if err := opts.preparedRuntime.adoptRunShape(&shape); err != nil {
+			if !opts.preparedFallback || !errors.Is(err, errPreparedShape) {
+				return -1, err
+			}
+			if closeErr := opts.preparedRuntime.Close(); closeErr != nil {
+				return -1, errors.Join(err, closeErr)
+			}
+			log.Printf("[sandbox-ctl] prepared runtime incompatible; closed unused VM before normal cold start: %v", err)
+			opts.preparedRuntime = nil
+		}
+	}
+	phase("adopt_shape")
 	if err := preparation.seal(shape, &launch); err != nil {
 		return -1, fmt.Errorf("seal cold preparation: %w", err)
 	}
-	r, err := Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
+	var r *Runtime
+	if opts.preparedRuntime != nil {
+		r = opts.preparedRuntime
+		err = r.launchPrepared(ctx, launch)
+	} else {
+		r, err = Start(ctx, SandboxSpec{Runtime: shape, Launch: launch})
+	}
 	if err != nil {
 		return -1, err
 	}
+	phase("launch")
 	return WaitRun(ctx, r)
 }
 
@@ -990,8 +1027,10 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
+	PrivateRAMFork        bool
 	MemoryLayout          snapshot.MemoryLayout
 	CaptureMemory         func(context.Context) (*memory.CaptureView, error)
+	BeginLiveMemory       func(context.Context, *memory.CaptureView) (*memory.CoWCapture, error)
 	checkpointMaintenance *diffstore.DirectoryMaintenance
 	EnableCheckpoint      bool
 	CheckpointDir         string // derived from the owning VM BaseDir
@@ -1085,9 +1124,11 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
-		memoryLayout:  h.MemoryLayout,
-		captureMemory: h.CaptureMemory,
-		Cfg:           h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		memoryLayout:    h.MemoryLayout,
+		PrivateRAMFork:  h.PrivateRAMFork,
+		captureMemory:   h.CaptureMemory,
+		beginLiveMemory: h.BeginLiveMemory,
+		Cfg:             h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1111,6 +1152,16 @@ func (h *SnapshotHandler) handleExport(req ctl.Request, cgroupPath string, chExi
 	return h.handleExportContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+	if req.NativeForkHandoff != nil {
+		if !h.PrivateRAMFork || !req.ResumeAfter || req.ForkDiskHandoff != nil {
+			return ctl.Response{}, errors.New("native fork requires a private RAM source and resume barrier")
+		}
+		handoff := *req.NativeForkHandoff
+		req.ForkDiskHandoff = func(ctx context.Context, ref, path string) error {
+			return ctl.SendForkDiskHandoff(ctx, handoff, ref, path)
+		}
+	}
+
 	if err := h.capture.begin(); err != nil {
 		return ctl.Response{}, err
 	}
@@ -1435,7 +1486,14 @@ func handleExportRequest(
 		forwarderNeedsAbort = false
 	}
 	sinkOpen = false // snapshot.Export owns and closes the sink on every path.
+	var beforeResume func(context.Context, *snapshot.SandboxOutput) error
+	if req.ForkDiskHandoff != nil {
+		beforeResume = func(ctx context.Context, out *snapshot.SandboxOutput) error {
+			return req.ForkDiskHandoff(ctx, out.SandboxRef, out.SandboxPath)
+		}
+	}
 	out, err := snapshot.Export(ctx, snapshot.ExportSources{
+		BeforeResume: beforeResume,
 		CheckpointID: req.CheckpointID,
 		SandboxID:    opts.SandboxID, APISock: chSock, CHApiDeadline: opts.Cfg.CHApiDeadline(),
 		PortableConfig: captureC0, ParentSandboxRef: parentRef,
@@ -1494,6 +1552,13 @@ func handleSnapshotRequest(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	saveStageStart := time.Now()
+	saveStage := func(name string) {
+		now := time.Now()
+		logf("SNAPSHOT_REQUEST_PHASE stage=%s duration=%s", name, now.Sub(saveStageStart))
+		saveStageStart = now
+	}
+	defer func() { saveStage("response_finalize") }()
 	req, err = prepareNamedCapture(req, opts, disks)
 	if err != nil {
 		return ctl.Response{}, err
@@ -1582,18 +1647,31 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: prospective C1: %w", err)
 	}
 
+	saveStage("disk_prepare")
 	opts.memoryLogf = logf
 	history, err := prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: memory history: %w", err)
 	}
 	defer func() { err = errors.Join(err, history.Close()) }()
+	var memoryComparison fetch.Stream
+	if opts.PrivateRAMFork && mergeRef && snapshotMode == ctl.SnapshotModeLocal && !req.Upload {
+		memoryComparison, err = comparisonMemory(ctx, opts, history.refs, uint64(mfd.Size()))
+		if err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot comparison base: %w", err)
+		}
+		if memoryComparison != nil {
+			defer func() { err = errors.Join(err, memoryComparison.Close()) }()
+			history.base = "" // The same retained suffix supplies unchanged pages.
+		}
+	}
 	resultMemoryRefs := history.refs
 	mergeMemory, memoryMergeBase := history.base != "", history.base
 	memoryMergeBaseOpener := newMemoryMergeBaseOpener(opts)
 	if mergeMemory {
 		memoryMergeBaseOpener = func(context.Context, string) (fetch.Stream, error) { return history.memory, nil }
 	}
+	saveStage("memory_history")
 	var (
 		dependencyPlan        *snapshotBundlePlan
 		bundleRefReplacements map[string]string
@@ -1665,6 +1743,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", errors.Join(err, planCloseErr))
 	}
 
+	saveStage("dependency_publish")
 	cfg := opts.Cfg
 	var historicalRef string
 	if history.historical != nil {
@@ -1734,6 +1813,8 @@ func handleSnapshotRequest(
 		releaseMemoryBarrier()
 	}()
 
+	var guestPauseStarted time.Time
+	var guestPauseMS *float64
 	guestRecoveryRequired := false
 	recoveryTerminated := false
 	reattachRunningGuest := func(reason string) error {
@@ -1745,6 +1826,10 @@ func handleSnapshotRequest(
 		}
 		if reattachErr := reattachMUX(); reattachErr != nil {
 			return fmt.Errorf("snapshot: stdio MUX re-attach after %s: %w", reason, reattachErr)
+		}
+		if !guestPauseStarted.IsZero() {
+			elapsed := float64(time.Since(guestPauseStarted).Microseconds()) / 1000
+			guestPauseMS = &elapsed
 		}
 		logf("stdio MUX re-attached after %s", reason)
 		guestRecoveryRequired = false
@@ -1861,6 +1946,8 @@ func handleSnapshotRequest(
 	if pinger != nil && pinger.Client != nil {
 		client = pinger.Client
 	}
+	saveStage("freeze_prepare")
+	guestPauseStarted = time.Now()
 	guestRecoveryRequired = true
 	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
 	if qerr != nil {
@@ -1895,6 +1982,7 @@ func handleSnapshotRequest(
 		}
 	}
 
+	saveStage("guest_quiesce")
 	// Pick the sink. --output writes sparse, content-addressed local files;
 	// --upload streams to a fresh Ingester (its own store client, never shared
 	// with the long-lived read-side fetcher). Either way Take streams the
@@ -1905,8 +1993,20 @@ func handleSnapshotRequest(
 	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
 	// E/C1 drops that direct parent to match. Cold/manifest parents stack.
 	src := snapshot.Sources{
-		CaptureMemory:         opts.captureMemory,
+		PrivateRAMFork:  opts.PrivateRAMFork,
+		CaptureMemory:   opts.captureMemory,
+		BeginLiveMemory: opts.beginLiveMemory,
+		ResumeGuest: func() error {
+			if err := reattachRunningGuest("live snapshot"); err != nil {
+				return err
+			}
+			if req.OnResume != nil {
+				req.OnResume()
+			}
+			return nil
+		},
 		MemoryWorkingSet:      !mergeRef,
+		MemoryDeltaBase:       memoryComparison,
 		CheckpointID:          req.CheckpointID,
 		Context:               ctx,
 		SandboxID:             sandboxID,
@@ -1939,6 +2039,9 @@ func handleSnapshotRequest(
 	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
 	if err != nil {
+		if errors.Is(err, snapshot.ErrLiveProtectionRecovery) {
+			return ctl.Response{}, failRecovery(err)
+		}
 		// SendQuiesce closes the old MUX and freezes the application. Take
 		// restores the VM/backend state on failure; reattach completes the
 		// guest-side recovery and thaws the application before we return.
@@ -1948,6 +2051,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, err
 	}
 
+	saveStage("snapshot_take")
 	// --resume: Take has resumed CH, but the guest closed the stdio MUX
 	// during quiesce. Re-establish it before reporting success: attach_ack is
 	// also the guest's thaw boundary. Do this before any upload work so the app,
@@ -1962,6 +2066,7 @@ func handleSnapshotRequest(
 	resp = ctl.Response{
 		MemorySize:       out.MemorySize,
 		MemoryResident:   out.MemoryResident,
+		GuestPauseMS:     guestPauseMS,
 		WallclockPauseMs: out.WallclockPauseMs,
 		WallclockDumpMs:  out.WallclockDumpMs,
 		DropCachesResult: dropCachesResult,

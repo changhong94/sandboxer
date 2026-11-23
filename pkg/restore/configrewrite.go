@@ -23,6 +23,13 @@ type pathRewrite struct {
 // preserved bit-for-bit (CH validates fields like memory.size against
 // state.json — keep them).
 func rewriteConfigPaths(in []byte, p pathRewrite) ([]byte, error) {
+	private, err := privateSnapshot(in)
+	if err != nil {
+		return nil, err
+	}
+	if private {
+		return rewritePrivateConfig(in, p)
+	}
 	var cfg map[string]any
 	if err := json.Unmarshal(in, &cfg); err != nil {
 		return nil, err
