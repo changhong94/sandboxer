@@ -28,9 +28,11 @@ func ValidateSize(size int64) error {
 }
 
 // Bytes and Pages require a validated capacity.
-func Bytes(size int64) int                 { return int((size/PageSize + 7) / 8) }
-func Pages(size int64) int                 { return (Bytes(size) + PayloadSize - 1) / PayloadSize }
-func Has(bitmap []byte, block uint64) bool { return bitmap[block/8]&(1<<(block%8)) != 0 }
+func Bytes(size int64) int { return int((size/PageSize + 7) / 8) }
+func Pages(size int64) int { return (Bytes(size) + PayloadSize - 1) / PayloadSize }
+func Has(bitmap []byte, block uint64) bool {
+	return bitmap != nil && bitmap[block/8]&(1<<(block%8)) != 0
+}
 func Set(bitmap []byte, block uint64) {
 	bitmap[block/8] |= byte(1 << (block % 8))
 }
@@ -38,6 +40,9 @@ func Set(bitmap []byte, block uint64) {
 // End returns the exclusive end of the logical-presence run starting at block.
 // It does not describe whether the run has physical payload.
 func End(p []byte, page, pages uint64) uint64 {
+	if p == nil {
+		return pages
+	}
 	set := Has(p, page)
 	page++
 	for page < pages {
@@ -80,7 +85,7 @@ func Encode(bitmap []byte, size int64, index int) []byte {
 // EncodeInto replaces one complete page, including padding, in caller-owned
 // scratch. The destination must not overlap bitmap.
 func EncodeInto(b, bitmap []byte, size int64, index int) {
-	if len(b) != PageSize || len(bitmap) != Bytes(size) || index < 0 || index >= Pages(size) {
+	if len(b) != PageSize || (bitmap != nil && len(bitmap) != Bytes(size)) || index < 0 || index >= Pages(size) {
 		panic("diffstore: invalid presence page")
 	}
 	clear(b)
@@ -89,7 +94,9 @@ func EncodeInto(b, bitmap []byte, size int64, index int) {
 	le.PutUint32(b[12:], uint32(Pages(size)))
 	le.PutUint64(b[16:], uint64(size))
 	start := index * PayloadSize
-	copy(b[HeaderSize:PageSize-4], bitmap[start:min(start+PayloadSize, len(bitmap))])
+	if bitmap != nil {
+		copy(b[HeaderSize:PageSize-4], bitmap[start:min(start+PayloadSize, len(bitmap))])
+	}
 	le.PutUint32(b[PageSize-4:], crc32.ChecksumIEEE(b[:PageSize-4]))
 }
 

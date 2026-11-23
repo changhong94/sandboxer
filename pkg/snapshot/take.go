@@ -36,8 +36,9 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
-	PrivateRAMFork bool
-	MemoryLayout   MemoryLayout // standalone callers with an existing stable layout
+	PrivateRAMFork  bool
+	MemoryDeltaBase sparse.Source
+	MemoryLayout    MemoryLayout // standalone callers with an existing stable layout
 	// CaptureMemory collects CH logs then freezes M/D/R after snapshot writes.
 	CaptureMemory    func(context.Context) (*memory.CaptureView, error)
 	MemoryWorkingSet bool
@@ -222,6 +223,12 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	ch := chapi.Client{Sock: s.APISock, RespDeadline: s.CHApiDeadline}
 
 	// T2a: pause CH.
+	phaseStart := time.Now()
+	phase := func(name string) {
+		now := time.Now()
+		logf("SNAPSHOT_SAVE_PHASE stage=%s duration=%s", name, now.Sub(phaseStart))
+		phaseStart = now
+	}
 	pauseStart := time.Now()
 	if err := ch.Pause(); err != nil {
 		return nil, fmt.Errorf("CH pause: %w", err)
@@ -250,6 +257,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, err
 	}
 
+	phase("pause_backends")
 	dumpStart := time.Now()
 	if s.PrivateRAMFork {
 		// Freeze disk generations before forking RAM. Persistence consumes only
@@ -287,12 +295,13 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			}
 			logf("private live capture: parent resumed before persistence pause_ms=%.3f", float64(time.Since(pauseStart).Microseconds())/1000)
 		}
-		if err := waitPrivateCapture(ctx, s.StagingDir); err != nil {
+		if err := waitPrivateCapture(ctx, s.StagingDir, func(ctx context.Context) error { return ch.CheckForkChild(ctx, operation.ID) }); err != nil {
 			return nil, err
 		}
 	} else if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
 		return nil, fmt.Errorf("CH snapshot: %w", err)
 	}
+	phase("frozen_capture")
 	configJSON, err := os.ReadFile(filepath.Join(s.StagingDir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("read config.json: %w", err)
@@ -412,6 +421,18 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		}
 		logf("live capture: parent resumed before persistence pause_ms=%.3f", float64(time.Since(pauseStart).Microseconds())/1000)
 	}
+	phase("memory_layout")
+	if s.MemoryDeltaBase != nil {
+		comparisonStart := time.Now()
+		workingMemory = memorySource
+		var inherited uint64
+		memorySource, inherited, err = CompareFrozenMemory(ctx, memorySource, s.MemoryDeltaBase)
+		if err != nil {
+			return nil, fmt.Errorf("compare frozen memory: %w", err)
+		}
+		logf("snapshot memory delta: inherited_data_bytes=%d duration=%s", inherited, time.Since(comparisonStart))
+	}
+	phase("memory_compare")
 	// T3: capture all disks once and emit Sandbox E while the same CH/backend
 	// freeze remains held. E is a dependency, not yet the operation root.
 	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
@@ -426,6 +447,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	}
 	out.SandboxRef, out.SandboxPath = sandboxOut.SandboxRef, sandboxOut.SandboxPath
 
+	phase("disk_checkpoint_export")
 	// T5: the memory-only snapshot.cfg points at E and carries only the memory
 	// parent chain.
 	snapshotCfg, err := MarshalConfig(&Config{
@@ -473,6 +495,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err != nil {
 		return nil, fmt.Errorf("build Snapshot S: %w", err)
 	}
+	phase("memory_metadata")
 	out.MemoryResident = storage.DataBytes + storage.ZeroBytes
 	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
 	var memoryBaseCloseErr error
@@ -483,6 +506,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err != nil || memoryBaseCloseErr != nil {
 		return nil, fmt.Errorf("absorb Snapshot S: %w", errors.Join(err, memoryBaseCloseErr))
 	}
+	phase("memory_pack_sync_publish")
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
@@ -503,6 +527,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	phase("commit_close")
 	dumpEnd := time.Now()
 
 	// T8: resume (destroy path handled by caller).

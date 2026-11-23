@@ -336,16 +336,22 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 
 	stagedDisks := false
 	if opts.EnableCheckpoint {
-		bases, err := c0.Checkpointed(sandboxSource.PortableRef)
+		stagedDisks, err = opts.PreparedSources.adoptSlotDisksForPortable(&snapCfg, c0, sandboxSource.PortableRef, &opts)
 		if err != nil {
 			return -1, err
 		}
-		stagedDisks, err = opts.PreparedSources.adoptSlotDisks(&snapCfg, bases, &opts)
-		if err == nil && !stagedDisks {
-			opts.checkpointPlan, err = sandbox.PrepareCheckpointDiskPlan(&snapCfg, bases, filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint"), opts.checkpointReopen)
-		}
-		if err != nil {
-			return -1, err
+		if !stagedDisks {
+			bases, baseErr := c0.Checkpointed(sandboxSource.PortableRef)
+			if baseErr != nil {
+				return -1, baseErr
+			}
+			stagedDisks, err = opts.PreparedSources.adoptSlotDisks(&snapCfg, bases, &opts)
+			if err == nil && !stagedDisks {
+				opts.checkpointPlan, err = sandbox.PrepareCheckpointDiskPlan(&snapCfg, bases, filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint"), opts.checkpointReopen)
+			}
+			if err != nil {
+				return -1, err
+			}
 		}
 	}
 	if !stagedDisks {
@@ -511,8 +517,14 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return -1, err
 	}
-	if _, err := config.WritePortableSandboxConfig(runDir, c0); err != nil {
-		return -1, fmt.Errorf("write immutable C0: %w", err)
+	portablePublished, err := opts.PreparedSources.publishPortable(runDir, c0)
+	if err != nil {
+		return -1, fmt.Errorf("publish immutable C0: %w", err)
+	}
+	if !portablePublished {
+		if _, err := config.WritePortableSandboxConfig(runDir, c0); err != nil {
+			return -1, fmt.Errorf("write immutable C0: %w", err)
+		}
 	}
 	finalConfig, finalState := rewritten, snapshotRoot.StateJSON
 
@@ -574,9 +586,46 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	memLayers := make([]fetch.Stream, 1, 1+len(parentMemoryLayers))
 	memLayers[0] = selfStream
 	memLayers = append(memLayers, parentMemoryLayers...)
+	// Prefer existing authenticated plaintext template leases for immutable lower
+	// layers. Do not create new copies or force packed carriers into page cache.
+	if privateRAM && opts.CustomerKeyFn != nil && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" {
+		key, keyErr := opts.CustomerKeyFn()
+		if keyErr != nil {
+			return -1, keyErr
+		}
+		fingerprint := sha256.Sum256(key[:])
+		clear(key[:])
+		for i, ref := range memoryConfig.FromRefs {
+			cached, cacheErr := cachedComparisonMemory(ctx, opts.RuntimeRoot, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"), fmt.Sprintf("%s:%x:%d", ref, fingerprint, capBytes), capBytes)
+			if cacheErr != nil {
+				return -1, cacheErr
+			}
+			if cached != nil {
+				defer cached.Close()
+				memLayers[i+1] = cached
+			}
+		}
+	}
 	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
+	}
+	if privateRAM && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" && opts.CustomerKeyFn != nil {
+		key, keyErr := opts.CustomerKeyFn()
+		if keyErr != nil {
+			return -1, keyErr
+		}
+		fingerprint := sha256.Sum256(key[:])
+		clear(key[:])
+		allowed := append([]string{selfRef}, memoryConfig.FromRefs...)
+		memoryBinding.ComparisonMemory = func(ctx context.Context, ref string, size uint64) (fetch.Stream, error) {
+			for _, known := range allowed {
+				if known == ref {
+					return cachedComparisonMemory(ctx, opts.RuntimeRoot, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"), fmt.Sprintf("%s:%x:%d", ref, fingerprint, size), size)
+				}
+			}
+			return nil, nil
+		}
 	}
 	templateMemory := false
 	if privateRAM && len(parentMemoryLayers) == 0 && templateCoWConfig(snapshotRoot.ConfigJSON) && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" && opts.CustomerKeyFn != nil && opts.SnapshotRef != "" {
@@ -592,8 +641,10 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			fingerprint := sha256.Sum256(key[:])
 			clear(key[:])
 			started := time.Now()
-			templateMemory, err = prepareTemplateMemory(ctx, opts.RuntimeRoot, stateDir,
-				fmt.Sprintf("%s:%x:%d", opts.SnapshotRef, fingerprint, capBytes), source, capBytes)
+			var releaseTemplate func()
+			templateMemory, releaseTemplate, err = prepareTemplateMemoryLease(ctx, opts.RuntimeRoot, stateDir,
+				fmt.Sprintf("%s:%x:%d", opts.SnapshotRef, fingerprint, capBytes), source, capBytes, templateMemoryBudget, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"))
+			defer releaseTemplate()
 			if err != nil {
 				return -1, fmt.Errorf("prepare template memory: %w", err)
 			}
@@ -683,10 +734,20 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		// The VMM remains paused until PostSpawn joins this persistence
 		// barrier. Independent device restoration can overlap durable graph
 		// publication; no guest write or Ready escapes before it completes.
+		retentionCtx := ctx
+		if p := opts.PreparedSources; p != nil && p.taken && p.slotPlan != nil && p.slotPlan.adopted {
+			// Matches already checked exact source, locations, key and policy.
+			// Keep that same borrowed capability for prepared dependency proofs.
+			if err := storage.Close(); err != nil {
+				return -1, err
+			}
+			storage = p.storage.BorrowWithFetcher(opts.Fetcher)
+			retentionCtx = artifact.WithPreparedCurrentDependencies(ctx, p.slotPlan.currentDependencies)
+		}
 		retentionCfg := snapCfg
 		retain := func() error {
 			started := time.Now()
-			e := sandbox.RetainCurrentDiskPlan(ctx, storage, opts.checkpointOwner, opts.CurrentRun, &retentionCfg, c0, sandboxSource.PortableRef, opts.checkpointPlan, capacities, opts.RefLocations, provenance)
+			e := sandbox.RetainCurrentDiskPlan(retentionCtx, storage, opts.checkpointOwner, opts.CurrentRun, &retentionCfg, c0, sandboxSource.PortableRef, opts.checkpointPlan, capacities, opts.RefLocations, provenance)
 			e = errors.Join(e, storage.Close())
 			logf("current disk graph persistence completed duration=%s error=%v", time.Since(started), e)
 			return e
@@ -718,15 +779,20 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	var forkGate *tapfd.ForkGate
 	var tapFile, netnsFile *os.File
 	var metaMAC, metaIP string
+	namedProviderLease := false
 	if snapCfg.Network.TapFD != nil {
 		var f, nsf *os.File
 		var meta tapfd.Metadata
 		var reused bool
 		if privateRAM && opts.PreparedRestore != nil {
-			f, nsf, meta, reused = opts.PreparedRestore.TakePreparedTap(snapCfg.Network.TapFD)
+			var name string
+			name, nsf, meta, forkGate, reused = opts.PreparedRestore.TakePreparedNamedTap(snapCfg.Network.TapFD)
 			if !reused {
 				return -1, errors.New("prepared restore provider capability does not match assigned lease")
 			}
+			snapCfg.Network.TAP, snapCfg.Network.TapFD = name, nil
+			namedProviderLease = true
+			defer forkGate.Close()
 		}
 		var err error
 		if !reused {
@@ -736,23 +802,19 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			return -1, fmt.Errorf("tapfd handoff: %w", err)
 		}
 		tapFile = f
-		defer tapFile.Close()
+		if tapFile != nil {
+			defer tapFile.Close()
+		}
 		netnsFile = nsf // non-nil only if the provider's tap is netns-isolated
 		if netnsFile != nil {
 			defer netnsFile.Close()
 		}
-		if reused {
-			forkGate = opts.PreparedRestore.TakePreparedGate(snapCfg.Network.TapFD)
-			if forkGate == nil {
-				return -1, errors.New("prepared TAP gate ownership lost")
-			}
-			defer forkGate.Close()
-		}
+
 		metaMAC, metaIP = meta.MAC, meta.IP
 		logf("tapfd: received tap fd for restore (mac=%s ip=%s netns=%t prepared=%t)", meta.MAC, meta.IP, netnsFile != nil, reused)
 	}
 	markRestore("tap_acquire")
-	exclusiveProviderLease := tapFile != nil
+	exclusiveProviderLease := tapFile != nil || namedProviderLease
 	if privateRAM && tapFile != nil {
 		name, err := tapfd.PersistentName(tapFile)
 		if err != nil {
@@ -782,11 +844,14 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		if err != nil {
 			return -1, fmt.Errorf("fork network: %w", err)
 		}
+		markRestore("network_bytes_ready")
 		// Validate the allocated child identity/state before touching any provider link.
 		if forkGate != nil {
 			err = forkGate.Hold() // Recheck device identity and gate before restore.
 		} else if tapFile != nil {
-			forkGate, err = tapfd.GateForFork(tapFile, netnsFile)
+			forkGate, err = tapfd.GateForAssignedRestore(tapFile, netnsFile)
+		} else if exclusiveProviderLease {
+			forkGate, err = tapfd.GateNamedForAssignedRestore(snapCfg.Network.TAP, netnsFile)
 		} else {
 			forkGate, err = tapfd.GateNamedForFork(snapCfg.Network.TAP, netnsFile)
 		}
@@ -797,6 +862,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		finalConfig, finalState = childConfig, childState
 	}
 
+	markRestore("network_device_gated")
 	// The shared back-half (memfd, uffd va_report handler, vhost-blk
 	// backends, the launch server — incl. the guest→host mem_report /
 	// app_exited channel that was missing on the restore path — pinger,
@@ -823,6 +889,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 
 	}
+	markRestore("network_state_published")
+	// CH now owns the on-disk launch state. Retain memory/disk source handles,
+	// but not per-instance copies of preparation-only JSON throughout its life.
+	opts.PreparedSources.releaseLaunchMetadata()
+	snapshotRoot.ConfigJSON, snapshotRoot.StateJSON = nil, nil
 	markRestore("network_rewrite_gate")
 	flushRestore() // keep instrumentation inside the measured readiness path
 	return sandbox.ServeAndWait(sandbox.VMParams{
@@ -934,7 +1005,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		// non-nil return aborts the run (ServeAndWait kills CH); we
 		// don't hand back a sandbox whose guest agent is unreachable.
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
-			if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
+			postStarted := time.Now()
+			if opts.PreparedRestore != nil {
+				if !opts.PreparedRestore.RestoreAcknowledged(runDir) {
+					return errors.New("prepared restore has no synchronous paused acknowledgement")
+				}
+			} else if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
 			if forkGate != nil {
@@ -942,6 +1018,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 					return fmt.Errorf("fork TAP hold before resume: %w", err)
 				}
 			}
+			pc.Logf("[restore ready gate] start_ns=%d end_ns=%d", postStarted.UnixNano(), time.Now().UnixNano())
 			var initialization *guestlink.RestoreInitialization
 			if len(opts.RestoreEnvdInit) > 0 {
 				initialization = &guestlink.RestoreInitialization{Body: opts.RestoreEnvdInit}

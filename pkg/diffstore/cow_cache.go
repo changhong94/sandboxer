@@ -838,8 +838,11 @@ func (c *Cache) stageZero(ctx context.Context, cow *Disk, block int64) error {
 
 func (c *Cache) run() {
 	defer close(c.done)
-	batch := make([]*cachePage, 0, maxWritebackMutations)
-	var records [maxWritebackMutations]pageWrite
+	// Prepared disks have no dirty pages. Do not charge each idle catalog for
+	// writeback scratch (or a large worker stack) before its first mutation.
+	var batch []*cachePage
+	var records []pageWrite
+	var candidates []*cachePage
 	aggregated := false
 	for {
 		c.mu.Lock()
@@ -858,6 +861,11 @@ func (c *Cache) run() {
 		}
 		wait := !aggregated && !c.urgent
 		c.mu.Unlock()
+		if records == nil {
+			batch = make([]*cachePage, 0, maxWritebackMutations)
+			records = make([]pageWrite, maxWritebackMutations)
+			candidates = make([]*cachePage, maxWritebackMutations)
+		}
 		if wait {
 			c.aggregate()
 		}
@@ -879,7 +887,6 @@ func (c *Cache) run() {
 			// with neighboring runs before unrelated logical pages. The
 			// bounded candidate list preserves batching for dispersed
 			// writes while retaining physical coalescing for mapped pages.
-			var candidates [maxWritebackMutations]*cachePage
 			count := 0
 			limit := maxWritebackPages
 			if anchor.zero {
@@ -919,6 +926,8 @@ func (c *Cache) run() {
 				}
 			}
 		}
+		// Candidate references must not retain released pages between batches.
+		clear(candidates)
 		if len(batch) == 0 {
 			c.mu.Unlock()
 			continue

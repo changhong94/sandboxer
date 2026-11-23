@@ -54,7 +54,10 @@ func (s *Store) PresenceBitmap(ctx context.Context) ([]byte, error) {
 	if err := s.healthy(ctx); err != nil {
 		return nil, err
 	}
-	return append([]byte(nil), s.presence...), nil
+	// Preserve the public dense snapshot contract even for a lazy zero store.
+	bitmap := make([]byte, presence.Bytes(s.Size()))
+	copy(bitmap, s.presence)
+	return bitmap, nil
 }
 
 func (s *Store) Presence(ctx context.Context, start uint64, dst []bool) error {

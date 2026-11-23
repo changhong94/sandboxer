@@ -80,7 +80,7 @@ type Store struct {
 	lockPath      string
 	info          Info
 	cipher        *xts.Cipher
-	presence      []byte // complete committed logical presence; protected by mu
+	presence      []byte // committed logical presence; nil means all zero; protected by mu
 	ctrl          control
 	cache         *pageCache
 	stats         Stats

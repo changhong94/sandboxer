@@ -273,7 +273,11 @@ func RunInherited(ctx context.Context, in InheritedOptions) (code int, retErr er
 		}
 		spec.MAC = mac
 		netSpec = spec
-		gate, err = tapfd.GateNamedForFork(tapName, nsFile)
+		if cfg.Network.TapFD != nil {
+			gate, err = tapfd.GateNamedForAssignedRestore(tapName, nsFile)
+		} else {
+			gate, err = tapfd.GateNamedForFork(tapName, nsFile)
+		}
 		if err != nil {
 			return -1, err
 		}

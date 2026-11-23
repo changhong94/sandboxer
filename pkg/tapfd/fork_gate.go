@@ -26,6 +26,30 @@ func GateForFork(tap, ns *os.File) (*ForkGate, error) {
 	return gateForFork(tap, ns, true)
 }
 
+// GateForAssignedRestore fences a fresh, exclusively leased restore TAP. Unlike
+// a running VM's gate, its desired post-identity state is UP even if a previous
+// unclaimed slot was torn down while fenced. Only Release after guest identity
+// acknowledgement activates it; Close continues to fail closed.
+func GateForAssignedRestore(tap, ns *os.File) (*ForkGate, error) {
+	gate, err := gateForFork(tap, ns, true)
+	if err != nil {
+		return nil, err
+	}
+	gate.wasUp = true
+	return gate, nil
+}
+
+// GateNamedForAssignedRestore is the named-TAP form for a fresh, exclusive
+// provider lease. It does not change the parent VM's network state.
+func GateNamedForAssignedRestore(name string, ns *os.File) (*ForkGate, error) {
+	gate, err := namedForkGate(name, ns, true)
+	if err != nil {
+		return nil, err
+	}
+	gate.wasUp = true
+	return gate, nil
+}
+
 // PrepareGateForFork retains a namespace-bound control socket without changing
 // link flags. The consumer must call Hold before restoring any tenant state.
 func PrepareGateForFork(tap, ns *os.File) (*ForkGate, error) {

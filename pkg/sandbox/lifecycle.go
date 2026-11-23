@@ -119,11 +119,12 @@ type RunSourceBinding struct {
 // MemorySourceBinding is restore-only, non-serializable lookup/provenance for
 // the current S. Disk state is intentionally absent: it belongs to C0/E.
 type MemorySourceBinding struct {
-	SnapshotRef  string
-	RuntimeRef   string
-	RelativeDir  string
-	FromRefs     []string
-	BundleSource *BundleSourceBinding
+	ComparisonMemory func(context.Context, string, uint64) (fetch.Stream, error)
+	SnapshotRef      string
+	RuntimeRef       string
+	RelativeDir      string
+	FromRefs         []string
+	BundleSource     *BundleSourceBinding
 }
 
 // BundleSourceBinding keeps physical Bundle lookup separate from logical
@@ -1551,6 +1552,13 @@ func handleSnapshotRequest(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	saveStageStart := time.Now()
+	saveStage := func(name string) {
+		now := time.Now()
+		logf("SNAPSHOT_REQUEST_PHASE stage=%s duration=%s", name, now.Sub(saveStageStart))
+		saveStageStart = now
+	}
+	defer func() { saveStage("response_finalize") }()
 	req, err = prepareNamedCapture(req, opts, disks)
 	if err != nil {
 		return ctl.Response{}, err
@@ -1639,18 +1647,31 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: prospective C1: %w", err)
 	}
 
+	saveStage("disk_prepare")
 	opts.memoryLogf = logf
 	history, err := prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: memory history: %w", err)
 	}
 	defer func() { err = errors.Join(err, history.Close()) }()
+	var memoryComparison fetch.Stream
+	if opts.PrivateRAMFork && mergeRef && snapshotMode == ctl.SnapshotModeLocal && !req.Upload {
+		memoryComparison, err = comparisonMemory(ctx, opts, history.refs, uint64(mfd.Size()))
+		if err != nil {
+			return ctl.Response{}, fmt.Errorf("snapshot comparison base: %w", err)
+		}
+		if memoryComparison != nil {
+			defer func() { err = errors.Join(err, memoryComparison.Close()) }()
+			history.base = "" // The same retained suffix supplies unchanged pages.
+		}
+	}
 	resultMemoryRefs := history.refs
 	mergeMemory, memoryMergeBase := history.base != "", history.base
 	memoryMergeBaseOpener := newMemoryMergeBaseOpener(opts)
 	if mergeMemory {
 		memoryMergeBaseOpener = func(context.Context, string) (fetch.Stream, error) { return history.memory, nil }
 	}
+	saveStage("memory_history")
 	var (
 		dependencyPlan        *snapshotBundlePlan
 		bundleRefReplacements map[string]string
@@ -1722,6 +1743,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot dependencies: %w", errors.Join(err, planCloseErr))
 	}
 
+	saveStage("dependency_publish")
 	cfg := opts.Cfg
 	var historicalRef string
 	if history.historical != nil {
@@ -1924,6 +1946,7 @@ func handleSnapshotRequest(
 	if pinger != nil && pinger.Client != nil {
 		client = pinger.Client
 	}
+	saveStage("freeze_prepare")
 	guestPauseStarted = time.Now()
 	guestRecoveryRequired = true
 	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
@@ -1959,6 +1982,7 @@ func handleSnapshotRequest(
 		}
 	}
 
+	saveStage("guest_quiesce")
 	// Pick the sink. --output writes sparse, content-addressed local files;
 	// --upload streams to a fresh Ingester (its own store client, never shared
 	// with the long-lived read-side fetcher). Either way Take streams the
@@ -1982,6 +2006,7 @@ func handleSnapshotRequest(
 			return nil
 		},
 		MemoryWorkingSet:      !mergeRef,
+		MemoryDeltaBase:       memoryComparison,
 		CheckpointID:          req.CheckpointID,
 		Context:               ctx,
 		SandboxID:             sandboxID,
@@ -2026,6 +2051,7 @@ func handleSnapshotRequest(
 		return ctl.Response{}, err
 	}
 
+	saveStage("snapshot_take")
 	// --resume: Take has resumed CH, but the guest closed the stdio MUX
 	// during quiesce. Re-establish it before reporting success: attach_ack is
 	// also the guest's thaw boundary. Do this before any upload work so the app,

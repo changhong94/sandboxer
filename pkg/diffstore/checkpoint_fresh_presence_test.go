@@ -44,7 +44,7 @@ func TestCheckpointFreshPresenceAndReopen(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer cow.Close()
-				if cow.Size() != test.size || len(cow.bitmap) != int((test.size/cowBlockSize+63)/64) {
+				if cow.Size() != test.size || (!test.template && len(cow.bitmap) != 0) {
 					t.Fatalf("wrong capacity/bitmap size: %d/%d", cow.Size(), len(cow.bitmap))
 				}
 				if !test.template && cow.DirtyCount() != 0 {

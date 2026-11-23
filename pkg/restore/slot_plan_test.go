@@ -109,3 +109,44 @@ func TestSlotPlanRejectsMutationCollisionAndOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestPreboundSlotRequiresExactPortableAndSource(t *testing.T) {
+	for _, mode := range []string{"ok", "source", "config", "writer", "graph"} {
+		t.Run(mode, func(t *testing.T) {
+			p, cfg, bases, opts := slotPlanFixture(t)
+			saved, err := bases.Clone()
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.slotPlan.stateFiles = &slotStateFiles{portable: saved}
+			p.sandbox = &openedSandboxSource{PortableRef: "source-A"}
+			source := "source-A"
+			switch mode {
+			case "source":
+				source = "source-B"
+			case "config":
+				bases.Launch.Exec = "/bin/false"
+			case "writer":
+				if err := os.WriteFile(p.slotPlan.disk.Disks[0].Path, []byte("tampered"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "graph":
+				cfg.Boot.Root.Base = "other"
+			}
+			ok, err := p.adoptSlotDisksForPortable(cfg, bases, source, opts)
+			if mode == "ok" {
+				if err != nil || !ok {
+					t.Fatalf("%v %v", ok, err)
+				}
+				if ok, _ := p.adoptSlotDisksForPortable(cfg, bases, source, opts); ok {
+					t.Fatal("double adoption")
+				}
+			} else if ok {
+				t.Fatal("changed identity accepted")
+			}
+			if mode == "writer" && err == nil {
+				t.Fatal("writer mutation not rejected")
+			}
+		})
+	}
+}

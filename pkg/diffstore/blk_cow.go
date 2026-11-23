@@ -87,7 +87,7 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 			// Fresh stores have no upper blocks. Keep frontend presence separate
 			// from committed backend presence without copying known-zero bytes.
 			// Templates determine capacity and start materializing below.
-			bitmap = make([]uint64, (diff.Size()/cowBlockSize+63)/64)
+			// nil represents a fully known, all-zero bitmap until the first write.
 		}
 	} else if !init.Existing && init.Template != nil {
 		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)
@@ -95,8 +95,7 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 			return nil, err
 		}
 		diff = fresh.diff
-		numBlocks := diff.Size() / cowBlockSize
-		bitmap = make([]uint64, int((numBlocks+63)/64))
+		// A fresh upper has no owned blocks; materialization publishes bits normally.
 	} else {
 		diff, err = openSingleDiff(diffPath, init, options)
 		if err != nil {
@@ -226,13 +225,16 @@ func popcount64(x uint64) int {
 func (c *Disk) blockDirty(blk int64) bool {
 	c.bitmapMu.RLock()
 	defer c.bitmapMu.RUnlock()
-	return c.bitmap[blk/64]&(1<<(uint64(blk)%64)) != 0
+	return bitmapBlockDirty(c.bitmap, blk)
 }
 
 // markDirty sets the bit for blk.
 func (c *Disk) markDirty(blk int64) {
 	c.bitmapMu.Lock()
 	defer c.bitmapMu.Unlock()
+	if c.bitmap == nil {
+		c.bitmap = make([]uint64, (c.size/cowBlockSize+63)/64)
+	}
 	c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
 }
 
@@ -769,7 +771,8 @@ func (c *Disk) activeView(ctx context.Context) (*cowSnapshotReaderAt, error) {
 	defer c.end(endOp)
 
 	c.bitmapMu.RLock()
-	bitmap := append([]uint64(nil), c.bitmap...)
+	// Keep an empty snapshot non-nil: nil selects the live bitmap in readRange.
+	bitmap := append([]uint64{}, c.bitmap...)
 	c.bitmapMu.RUnlock()
 
 	return &cowSnapshotReaderAt{cow: c, bitmap: bitmap}, nil
@@ -866,12 +869,18 @@ func (c *Disk) runlockBlockRange(first, last int64) {
 }
 
 func bitmapBlockDirty(bitmap []uint64, blk int64) bool {
+	if len(bitmap) == 0 {
+		return false
+	}
 	return bitmap[blk/64]&(1<<(uint64(blk)%64)) != 0
 }
 
 // bitmapRunEnd finds a change of presence in [block, limit). The caller supplies
 // a nonempty range within the bitmap's logical capacity; padding bits are ignored.
 func bitmapRunEnd(bitmap []uint64, block, limit uint64) uint64 {
+	if len(bitmap) == 0 {
+		return limit
+	}
 	var invert uint64
 	if bitmapBlockDirty(bitmap, int64(block)) {
 		invert = ^uint64(0)

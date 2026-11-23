@@ -28,6 +28,7 @@ import (
 // until the controller's durable assignment and normal restore validation.
 type PreparedRestore struct {
 	preparedMAC string
+	preparedTAP string
 	mu          sync.Mutex
 	cmd         *exec.Cmd
 	runDir      string
@@ -64,6 +65,9 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 		return nil, err
 	}
 	defer preparedLimits.Cleanup()
+	if err := ensurePreparedRuntimeRoot(spec.RuntimeRoot); err != nil {
+		return nil, err
+	}
 	r := &PreparedRestore{preparedMAC: spec.Network.MAC, runDir: filepath.Join(spec.RuntimeRoot, spec.PathID), cleanup: func() {}}
 	if err = os.Mkdir(r.runDir, 0700); err != nil {
 		return nil, err
@@ -88,13 +92,21 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 		if e = json.Unmarshal(raw, &r.tapConfig); e != nil {
 			return nil, e
 		}
-		if _, e = tapfd.PersistentName(f); e != nil {
+		if r.preparedTAP, e = tapfd.PersistentName(f); e != nil {
 			return nil, e
 		}
-		r.gate, e = tapfd.PrepareGateForFork(f, n)
+		r.gate, e = tapfd.GateForAssignedRestore(f, n)
 		if e != nil {
 			return nil, e
 		}
+
+		// This exclusive persistent TAP will be reopened by CH by name.
+		// Close its unused queue before advertising the slot, retaining the
+		// namespace-bound identity gate and provider capability for claim.
+		if e = f.Close(); e != nil {
+			return nil, e
+		}
+		r.tap = nil
 
 	}
 	if err = os.Mkdir(filepath.Join(r.runDir, "snap-state"), 0700); err != nil {
@@ -182,8 +194,27 @@ func (r *PreparedRestore) TakePreparedGate(cfg *config.TapFDConfig) *tapfd.ForkG
 	return gate
 }
 
-func (r *PreparedRestore) Restore(ctx context.Context, runDir, stateDir string) (*exec.Cmd, error) {
+// TakePreparedNamedTap transfers the exclusive provider lease exactly once.
+// The retained gate rechecks the interface index before any device restore.
+func (r *PreparedRestore) TakePreparedNamedTap(cfg *config.TapFDConfig) (string, *os.File, tapfd.Metadata, *tapfd.ForkGate, bool) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.transferred || r.preparedTAP == "" || r.gate == nil || r.tap != nil || !reflect.DeepEqual(cfg, r.tapConfig) {
+		return "", nil, tapfd.Metadata{}, nil, false
+	}
+	name, ns, meta, gate := r.preparedTAP, r.netns, r.tapMetadata, r.gate
+	r.preparedTAP, r.netns, r.gate = "", nil, nil
+	return name, ns, meta, gate, true
+}
+
+func (r *PreparedRestore) Restore(ctx context.Context, runDir, stateDir string) (*exec.Cmd, error) {
+	started := time.Now()
+	r.mu.Lock()
+	locked := time.Now()
+	defer func() {
+		end := time.Now()
+		fmt.Fprintf(os.Stderr, "[prepared restore submit] run=%s start_ns=%d lock_ns=%d end_ns=%d lock_wait_ns=%d api_ns=%d\n", filepath.Base(runDir), started.UnixNano(), locked.UnixNano(), end.UnixNano(), locked.Sub(started).Nanoseconds(), end.Sub(locked).Nanoseconds())
+	}()
 	defer r.mu.Unlock()
 	if r.closed || r.transferred || filepath.Clean(runDir) != r.runDir {
 		return nil, errors.New("prepared restore ownership mismatch")
@@ -194,6 +225,15 @@ func (r *PreparedRestore) Restore(ctx context.Context, runDir, stateDir string) 
 	r.transferred = true
 	fmt.Fprintf(os.Stderr, "prepared restore KVM consumed pid=%d run=%s\n", r.cmd.Process.Pid, filepath.Base(runDir))
 	return r.cmd, nil
+}
+
+// RestoreAcknowledged is valid only for the synchronous vm.restore API path.
+// CH sends success after device/vCPU restoration with resume=false. The CLI
+// path has no such acknowledgement and must still poll vm.info for Paused.
+func (r *PreparedRestore) RestoreAcknowledged(runDir string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.closed && r.transferred && filepath.Clean(runDir) == r.runDir
 }
 
 // DiscardEmpty releases unused KVM resources while preserving restore files
@@ -246,8 +286,34 @@ func (r *PreparedRestore) PreparedNetworkMAC() string { return r.preparedMAC }
 func (r *PreparedRestore) PreparedNetworkTAP() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || r.transferred || r.tap == nil {
+	if r.closed || r.transferred || r.gate == nil {
+		return "", nil
+	}
+	if r.preparedTAP != "" {
+		return r.preparedTAP, nil
+	}
+	if r.tap == nil {
 		return "", nil
 	}
 	return tapfd.PersistentName(r.tap)
+}
+
+// /run is empty after a host reboot. The generic pool can start before any
+// assigned sandbox has created its runtime parent; do not rely on that order.
+func ensurePreparedRuntimeRoot(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
+		return errors.New("invalid prepared runtime root")
+	}
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return err
+	}
+	st, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	owner, ok := st.Sys().(*syscall.Stat_t)
+	if !st.IsDir() || st.Mode().Perm()&0022 != 0 || !ok || owner.Uid != uint32(os.Geteuid()) {
+		return errors.New("prepared runtime root must be an owned non-writable directory")
+	}
+	return nil
 }

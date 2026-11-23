@@ -257,6 +257,7 @@ type SnapDiskRef struct {
 // parts — config resolution, the CH cmdline, the post-spawn settle
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (exitCode int, retErr error) {
+	backendStarted := time.Now()
 	if p.owner == nil {
 		p.owner, _ = p.Ctx.Value(runtimeOwnerKey{}).(*Runtime)
 	}
@@ -1217,6 +1218,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		chPid = inherited.PID
 	} else {
 		if p.StartPreparedCH != nil {
+			p.Logf("[prepared backends] run=%s start_ns=%d end_ns=%d", p.SandboxID, backendStarted.UnixNano(), time.Now().UnixNano())
 			cmd, err = p.StartPreparedCH(backendCtx)
 		} else {
 			err = startCH(cmd, p.NetnsFile)

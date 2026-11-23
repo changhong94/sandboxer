@@ -7,6 +7,7 @@
 package snapshotfile
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -150,16 +151,17 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 	if err := ValidateDirty(tailzip.Section{Source: stream, Length: base}, bodies[MemoryDirtyName]); err != nil {
 		return fail(err)
 	}
-	// parseArchive allocated private buffers for this Open; transfer ownership
-	// directly instead of copying the captured device state a second time.
+	// The archive entries share one backing buffer. Transfer the large launch
+	// state without copying, but detach the small fields retained after launch
+	// so releasing ConfigJSON/StateJSON can reclaim that buffer.
 	owner := &streamOwner{stream: stream}
 	return &Root{
 		FullStream:     &sectionStream{owner: owner, size: stream.Size()},
 		Memory:         &sectionStream{owner: owner, size: base},
 		ConfigJSON:     bodies[ConfigJSONName][:len(bodies[ConfigJSONName]):len(bodies[ConfigJSONName])],
 		StateJSON:      bodies[StateJSONName][:len(bodies[StateJSONName]):len(bodies[StateJSONName])],
-		SnapshotConfig: bodies[SnapshotCfgName][:len(bodies[SnapshotCfgName]):len(bodies[SnapshotCfgName])],
-		MemoryDirty:    bodies[MemoryDirtyName][:len(bodies[MemoryDirtyName]):len(bodies[MemoryDirtyName])],
+		SnapshotConfig: bytes.Clone(bodies[SnapshotCfgName]),
+		MemoryDirty:    bytes.Clone(bodies[MemoryDirtyName]),
 		ArchiveBase:    base, owner: owner,
 	}, nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"golang.org/x/sys/unix"
@@ -101,5 +102,48 @@ func TestPrivateLocalPinnedFDAndSparseLayout(t *testing.T) {
 	}
 	if !bytes.Equal(got, data[:4096]) {
 		t.Fatal("pinned bytes changed after unlink")
+	}
+}
+
+func TestPrivateLocalLayeredFiles(t *testing.T) {
+	root := t.TempDir()
+	makeSource := func(name string, value byte, holes []sparse.Extent) *templateComparison {
+		t.Helper()
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, bytes.Repeat([]byte{value}, 12288), 0400); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		src, err := sparse.NewSource(f, 12288, holes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &templateComparison{Source: src, file: f}
+	}
+	base := makeSource("base", 0x51, nil)
+	delta := makeSource("delta", 0x73, []sparse.Extent{{Offset: 4096, Size: 8192}})
+	plan, err := planPrivateLocal(fetch.NewLayered(delta, base), 12288)
+	if err != nil || plan == nil {
+		t.Fatalf("plan: %v %v", plan, err)
+	}
+	if len(plan.files) != 2 || len(plan.extents) != 2 {
+		t.Fatalf("wrong layered plan: %#v", plan)
+	}
+	for i, e := range plan.extents {
+		b := make([]byte, e[1])
+		if _, err := plan.files[e[3]].ReadAt(b, int64(e[2])); err != nil {
+			t.Fatal(err)
+		}
+		want := byte(0x73)
+		if i == 1 {
+			want = 0x51
+		}
+		if !bytes.Equal(b, bytes.Repeat([]byte{want}, len(b))) {
+			t.Fatal("wrong file or offset")
+		}
 	}
 }

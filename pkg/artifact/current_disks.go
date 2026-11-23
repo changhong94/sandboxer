@@ -81,10 +81,13 @@ func (s *ProcessStorage) RetainCurrentDisks(ctx context.Context, owner *diffstor
 	if err := owner.Validate(); err != nil {
 		return err
 	}
+	mark, finish := currentTiming("retain", owner.Directory)
+	defer finish()
 	raw, err := config.MarshalPortableSandboxConfig(cfg)
 	if err != nil {
 		return err
 	}
+	mark("canonical_config")
 	version := 1
 	for _, disk := range cfg.Boot.Disks {
 		if disk.Slot != nil {
@@ -96,6 +99,7 @@ func (s *ProcessStorage) RetainCurrentDisks(ctx context.Context, owner *diffstor
 	if _, err := set.validate(); err != nil {
 		return err
 	}
+	mark("validate_set")
 	seen := map[string]bool{}
 	for _, dep := range portableDiskRefs(cfg) {
 		if seen[dep.raw] {
@@ -113,13 +117,23 @@ func (s *ProcessStorage) RetainCurrentDisks(ctx context.Context, owner *diffstor
 			if err != nil {
 				return err
 			}
-			opened, err := s.OpenFileWithLocations(ctx, path, actual, locations)
+			physical, prepared, err := s.preparedCurrentPath(ctx, owner, path, actual, dep.raw, locations)
 			if err != nil {
-				return fmt.Errorf("current dependency %s: %w", dep.raw, err)
-			}
-			physical := opened.ResolvedPath()
-			if err := opened.Close(); err != nil {
 				return err
+			}
+			mark("dependency_identity")
+			if !prepared {
+				opened, err := s.OpenFileWithLocations(ctx, path, actual, locations)
+				if err != nil {
+					return fmt.Errorf("current dependency %s: %w", dep.raw, err)
+				}
+				physical = opened.ResolvedPath()
+				if err := opened.Close(); err != nil {
+					return err
+				}
+				mark("dependency_open")
+			} else {
+				mark("dependency_prepared")
 			}
 			if physical == "" {
 				physical = path
@@ -154,6 +168,7 @@ func (s *ProcessStorage) RetainCurrentDisks(ctx context.Context, owner *diffstor
 		}
 		set.Dependencies = append(set.Dependencies, entry)
 	}
+	mark("resolve_dependencies")
 	return writeCurrentJSON(filepath.Join(owner.Directory, currentDisksName), &set)
 }
 
@@ -243,21 +258,27 @@ func readCurrentJSON(path string, v any) ([]byte, error) {
 var ErrCurrentMetadataPublished = errors.New("current metadata published with pending directory sync")
 
 func writeCurrentJSON(path string, v any) (retErr error) {
+	mark, finish := currentTiming("publish", path)
+	defer finish()
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
+	mark("json_encode")
 	f, err := os.CreateTemp(filepath.Dir(path), ".current-disks-")
 	if err != nil {
 		return err
 	}
+	mark("create_temp")
 	defer os.Remove(f.Name())
 	if _, err := f.Write(b); err != nil {
 		return errors.Join(err, f.Close())
 	}
+	mark("write")
 	if err := errors.Join(f.Sync(), f.Close()); err != nil {
 		return err
 	}
+	mark("file_sync_close")
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -266,9 +287,11 @@ func writeCurrentJSON(path string, v any) (retErr error) {
 	if err := os.Rename(f.Name(), path); err != nil {
 		return err
 	}
+	mark("open_dir_rename")
 	if err := dir.Sync(); err != nil {
 		return errors.Join(ErrCurrentMetadataPublished, err)
 	}
+	mark("dir_sync")
 	return nil
 }
 

@@ -336,7 +336,9 @@ func create(path string, o Options, asynchronous bool, beforeIO func(string) err
 		return nil, err
 	}
 	info, _, _ := parseHeader(h, nil, true)
-	s := &Store{presence: make([]byte, presence.Bytes(info.LogicalSize)), file: f, lock: lock,
+	// The initial committed presence is entirely zero. Still serialize all
+	// validated presence pages; only its in-memory allocation is deferred.
+	s := &Store{file: f, lock: lock,
 		lockPath: lockPath, info: info, cipher: xc, ctrl: control{Next: 1, Epoch: 1},
 		cache: newCache(cachePages), initDone: make(chan struct{}), beforeIO: beforeIO}
 	initialize := func() {

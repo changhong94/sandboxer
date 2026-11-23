@@ -153,3 +153,59 @@ unchanged. See [CH capability and compatibility](vmm.md#patch-0012).
 [Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Sandbox and Snapshot artifacts](artifacts.md) | [Block storage: devices, writable state and checkpoints](block-storage.md) | [Resource control and usage accounting](resources.md) | [Guest ABI: boot, applications and host protocols](guest-abi.md) | [VMM integration and Cloud Hypervisor patches](vmm.md)
 
 [Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)
+
+The optional template cache supports KUASAR_TEMPLATE_MEMORY_CACHE_DIR: a private
+disk-backed directory with bounded sparse cache files. Prepared slots populate
+it once per authenticated template. Live restores hold shared file-lock leases;
+eviction skips leased files. File data and directory are synced before reuse.
+VM RAM stays MAP_PRIVATE CoW. Clean file pages are reclaimable, without mlock or
+full guest RAM copying. The original snapshot remains authoritative; cache disk
+allocation, residency and initial preparation must be accounted separately.
+
+When a durable expanded template cache is enabled, deployments may set
+`KUASAR_TEMPLATE_PACKED_SOURCE_ROOT` to their private publication directory.
+After acquiring the expanded cache lease, staging advises the redundant bulk
+of the authenticated packed source out of the host page cache. The first and
+last MiB remain eligible for metadata reuse. The source file is neither deleted
+nor modified, and remains authoritative for cache reconstruction. The hint is
+limited to regular files within the owned, non-group/world-writable directory,
+with the authenticated device/inode/size/timestamps still matching. An advisory
+failure does not skip validation or persistence. This is not a memory limit:
+concurrent readers can bring source pages back into cache. Measure both packed
+and expanded cache residency, and avoid counting mapped file pages twice when
+combining process PSS with page cache. Do not warm the redundant packed payload
+when benchmarking the expanded restore path.
+
+Prepared slot launch metadata (`config.json` and `state.json`) is verified in
+preparation, synced, and published read-only. Claim still compares the requested
+bytes with the prepared plan and checks device/inode/size/mtime/ctime/mode before
+linking. It checks the linked destination identity as well. A changed file,
+restored mtime, replacement inode, or destination collision fails closed. This
+uses the same trusted-host file-version model as authenticated source catalogs;
+it is not a defense against a privileged host administrator. Claim additionally
+compares the file contents: timestamp granularity alone does not reliably detect
+a same-size edit with restored mtime. No extra guest RAM is cached or guest command run. Network rewriting and TAP gating remain on the validated restore path.
+
+Generic private-RAM slots also close the unused persistent TAP queue during
+preparation. They retain the exclusive provider capability, interface name,
+namespace descriptor and index-checked gate; CH reopens that same interface.
+A claim must match the exact provider capability and consume it once. The gate
+is reasserted before device restore and before vCPU resume, and released only
+after guest identity acknowledgement. A prepared empty-slot lease requests UP
+on successful release even when its recycled interface was initially DOWN;
+New provider-assigned child interfaces use the same rule on running-VM fork;
+caller-supplied TAP gates retain their existing state-preserving behavior.
+Closing a failed or unclaimed slot never releases its gate. This moves queue
+teardown into generic pool preparation, without per-image VM pools.
+
+The immutable portable C0 is rendered and schema-validated during slot staging,
+with its file synced on the private runtime filesystem. Claim checks canonical
+bytes and file contents/version, publishes with RENAME_NOREPLACE, and syncs the
+final directory. Changed configuration falls back to ordinary validated C0
+publication. This avoids repeating canonical schema parsing and data writing.
+
+For prepared VMs, vm.restore is synchronous and explicitly requests resume=false.
+Its successful response, bound to the exact prepared owner, is the paused restore
+barrier; it is not merely evidence that the API socket exists. Only this path
+avoids a subsequent vm.info poll. CLI restore still waits for Paused through
+vm.info. The pre-resume TAP fence, persistence join and guest identity ACK remain.

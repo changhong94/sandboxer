@@ -524,6 +524,9 @@ func (t *transaction) commit() error {
 	s.retiredFlag.Store(t.ctrl.Retired)
 	for p, b := range t.pages {
 		if presencePage(p, s.Size()) {
+			if s.presence == nil {
+				s.presence = make([]byte, presence.Bytes(s.Size()))
+			}
 			i := int(p - presenceAreaPage)
 			n := min(presence.PayloadSize, len(s.presence)-i*presence.PayloadSize)
 			copy(s.presence[i*presence.PayloadSize:], b[presence.HeaderSize:presence.HeaderSize+n])

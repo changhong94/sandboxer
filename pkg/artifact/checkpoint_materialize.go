@@ -225,6 +225,9 @@ func (p *Publisher) keepPortable(ctx context.Context, raw string, scope publishS
 	if err != nil {
 		return "", false, err
 	}
+	if p.materializeLocated && ref.Scheme == manifest.RefSchemeFile {
+		return "", false, nil
+	}
 	if p.transientLocations[ref.Location] {
 		return "", false, nil
 	}

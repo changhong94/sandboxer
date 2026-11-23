@@ -11,7 +11,7 @@ import (
 // Cancellation closes only the client transport; the server still owns safe
 // capture completion and recovery. Callers must reconcile persisted results.
 func Capture(ctx context.Context, socket string, req Request) (Response, error) {
-	if req.Type != TypeSnapshotRequest {
+	if req.Type != TypeSnapshotRequest && req.Type != TypeCheckpointSnapshotRequest {
 		return Response{}, errors.New("capture: memory snapshot request required")
 	}
 	conn, close, err := dialContext(ctx, socket)
@@ -38,7 +38,7 @@ func Capture(ctx context.Context, socket string, req Request) (Response, error) 
 		}
 	}
 	if resp.Type == TypeError {
-		return resp, fmt.Errorf("capture: %s", resp.Msg)
+		return resp, fmt.Errorf("capture: %w", CaptureError(resp))
 	}
 	if resp.Type != TypeSnapshotDone || resp.SnapshotRef == "" || resp.SandboxRef == "" {
 		return resp, errors.New("capture: incomplete committed artifact response")

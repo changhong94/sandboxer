@@ -181,23 +181,36 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	}
 	var options []tarstream.WriteOption
 	if kind == "snapshot" {
-		options = append(options, tarstream.WithIndexMemoryLimit(memoryIndexBudget))
+		options = append(options, tarstream.WithIndexMemoryLimit(memoryIndexBudget), tarstream.WithSparseIdentity())
 	}
 	if s.codec != nil {
 		options = append(options, tarstream.WithCodec(s.codec, s.required))
 	}
 	packStart := time.Now()
-	scheme, digest, err := tarstream.WriteTo(ctx, f, kind, src, options...)
+	var writer io.Writer = f
+	var writeback *snapshotWriteback
+	if kind == "snapshot" {
+		writeback = &snapshotWriteback{file: f, submit: unix.SyncFileRange}
+		writer = writeback
+	}
+	scheme, digest, err := tarstream.WriteTo(ctx, writer, kind, src, options...)
+	if writeback != nil {
+		s.logf("SNAPSHOT_WRITEBACK queued_bytes=%d calls=%d submit_duration=%s unsupported=%t", writeback.queued, writeback.calls, writeback.elapsed, writeback.disabled)
+	}
 	s.logf("artifact phase: kind=%s stage=pack duration=%s", kind, time.Since(packStart))
 	if err != nil {
 		_ = f.Close()
 		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
 	}
+	statStart := time.Now()
 	info, statErr := f.Stat()
+	s.logf("artifact phase: kind=%s stage=stat duration=%s", kind, time.Since(statStart))
 	syncStart := time.Now()
 	syncErr := f.Sync()
 	s.logf("artifact phase: kind=%s stage=sync duration=%s", kind, time.Since(syncStart))
+	closeStart := time.Now()
 	closeErr := f.Close()
+	s.logf("artifact phase: kind=%s stage=close duration=%s", kind, time.Since(closeStart))
 	if statErr != nil || syncErr != nil || closeErr != nil {
 		return "", "", "", errors.Join(statErr, syncErr, closeErr)
 	}
@@ -205,7 +218,9 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		s.logf("snapshot memory carrier: physical_bytes=%d identity=%s:%s", info.Size(), scheme, digest)
 	}
 	final := filepath.Join(s.outDir, digest+"."+kind)
+	renameStart := time.Now()
 	err = unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)
+	s.logf("artifact phase: kind=%s stage=rename duration=%s", kind, time.Since(renameStart))
 	if err == unix.EEXIST {
 		// A codec-backed write always emits ciphertext, including in auto
 		// mode. Reuse must therefore prove that an existing final has the
@@ -225,6 +240,8 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		return "", "", "", fmt.Errorf("commit %s without replacement: %w", kind, err)
 	}
 	keepTmp = true // rename consumed the path; deferred cleanup has nothing to remove
+	dirStart := time.Now()
+	defer func() { s.logf("artifact phase: kind=%s stage=directory_sync duration=%s", kind, time.Since(dirStart)) }()
 	if err := syncLocalPath(s.outDir, true); err != nil {
 		return "", "", "", err
 	}

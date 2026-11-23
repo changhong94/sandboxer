@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -50,6 +51,7 @@ func (p *PreparedSources) CheckStageFiles() error {
 }
 
 type slotRestorePlan struct {
+	currentDependencies            *artifact.PreparedCurrentDependencies
 	stateFiles                     *slotStateFiles
 	backends                       []sandbox.DiskBackend
 	cleanup                        func() error
@@ -93,8 +95,9 @@ func syncStageDir(path string) error {
 }
 
 // StageForSlot is preparation, before the generic slot is advertised Ready.
-// It prepares only authenticated metadata and independent, durable empty CoW
-// writers. No guest RAM is copied and no template VM or guest command is run.
+// It prepares authenticated metadata, bounded resident template extents and
+// independent durable empty CoW writers. No full guest RAM copy, template VM
+// or guest command is run.
 func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.RuntimeSpec, files map[string]StageFileVersion, preparedTap ...string) (retErr error) {
 	<-p.done
 	if p.err != nil {
@@ -162,6 +165,10 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	}
 	defer owner.Close()
 	bases, err := c0.Checkpointed(p.sandbox.PortableRef)
+	if err != nil {
+		return err
+	}
+	plan.currentDependencies, err = p.storage.PrepareCurrentDependencies(ctx, owner, bases, p.opts.RefLocations)
 	if err != nil {
 		return err
 	}
@@ -276,6 +283,9 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 				_ = plan.stateFiles.close()
 			}
 		}()
+		if err = plan.stateFiles.preparePortable(c0); err != nil {
+			return err
+		}
 	}
 	if p.image != nil {
 		p.image.close()
@@ -309,11 +319,27 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	if err = syncStageDir(base); err != nil {
 		return err
 	}
+	if err = p.stageTemplateMemory(ctx, spec.RuntimeRoot, cap); err != nil {
+		return err
+	}
 	p.slotPlan = plan
 	log.Printf("slot restore plan prepared duration=%s disks=%d", time.Since(started), len(plan.disk.Disks))
 	return nil
 }
+
+// Reuse the already-bound disk IDs only when the exact immutable C0 and source
+// identity match preparation. The ordinary graph, file-version, directory and
+// one-use ownership checks still run below. This retains no additional cache.
+func (p *PreparedSources) adoptSlotDisksForPortable(cfg *config.SandboxConfig, c0 *config.PortableSandboxConfig, source string, opts *Options) (bool, error) {
+	if p == nil || !p.taken || p.sandbox == nil || p.sandbox.PortableRef != source || p.slotPlan == nil || p.slotPlan.stateFiles == nil || p.slotPlan.stateFiles.portable == nil || !reflect.DeepEqual(c0, p.slotPlan.stateFiles.portable) {
+		return false, nil
+	}
+	return p.adoptSlotDisksChecked(cfg, nil, opts, true)
+}
 func (p *PreparedSources) adoptSlotDisks(cfg *config.SandboxConfig, bases *config.PortableSandboxConfig, opts *Options) (bool, error) {
+	return p.adoptSlotDisksChecked(cfg, bases, opts, false)
+}
+func (p *PreparedSources) adoptSlotDisksChecked(cfg *config.SandboxConfig, bases *config.PortableSandboxConfig, opts *Options, prebound bool) (bool, error) {
 	if p == nil || !p.taken || p.slotPlan == nil || p.slotPlan.adopted || len(opts.checkpointReopen) != 0 {
 		return false, nil
 	}
@@ -338,8 +364,13 @@ func (p *PreparedSources) adoptSlotDisks(cfg *config.SandboxConfig, bases *confi
 	}
 	directory := opts.checkpointOwner.Directory
 	next := &sandbox.CheckpointDiskPlan{Directory: directory, Disks: append([]sandbox.CheckpointDiskBinding(nil), plan.disk.Disks...)}
-	if err := next.Bind(bases); err != nil {
-		return false, err
+	if len(next.Disks) != len(cfg.Boot.Disks)+1 {
+		return false, errors.New("staged disk topology mismatch")
+	}
+	if !prebound {
+		if err := next.Bind(bases); err != nil {
+			return false, err
+		}
 	}
 	for i, d := range next.Disks {
 		if d.BaseID != plan.disk.Disks[i].BaseID {
@@ -380,7 +411,7 @@ func (p *PreparedSources) adoptSlotDisks(cfg *config.SandboxConfig, bases *confi
 	}
 	opts.checkpointPlan = next
 	plan.adopted = true
-	log.Printf("slot restore plan adopted disks=%d", len(next.Disks))
+	log.Printf("slot restore plan adopted disks=%d prebound=%t", len(next.Disks), prebound)
 	return true, nil
 }
 

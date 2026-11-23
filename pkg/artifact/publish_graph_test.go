@@ -627,3 +627,57 @@ func TestPublisherHonorsCanceledContextWithoutOutput(t *testing.T) {
 }
 
 var _ fetch.Stream = (*recordedStream)(nil)
+
+func TestCompletePublicationUploadsLocatedDependency(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	storage, e := NewProcessStorage(nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer storage.Close()
+	sink := snapshot.NewFileSink(dir, "located", nil, false, nil)
+	raw, _, e := sink.AbsorbOverlay(ctx, bytes.NewReader(bytes.Repeat([]byte{17}, 4096)), nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ref, e := manifest.ParseRef(raw)
+	if e != nil {
+		t.Fatal(e)
+	}
+	ref.Location = "seed"
+	cfg, _ := publishPortable(t, ref.String())
+	logical, e := sandboxfile.BuildSource(publishSource(t, bytes.Repeat([]byte{29}, 4096)), nil, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, path, e := sink.AbsorbSandbox(ctx, logical)
+	if e != nil {
+		t.Fatal(e)
+	}
+	target := &recordingPublishTarget{}
+	p := newPublisher(storage, config.RefLocations{"seed": dir}, target, nil)
+	p.materializeLocated = true
+	if _, e = p.Publish(ctx, path); e != nil {
+		t.Fatal(e)
+	}
+	if len(target.calls) != 2 || target.calls[0].role != RoleOverlay || target.calls[1].role != RoleSandbox {
+		t.Fatalf("not bottom-up: %+v", target.calls)
+	}
+	root := openRecordedSandbox(t, target.calls[1].body)
+	defer root.Close()
+	refs := root.Portable.Boot.Root.BaseFromRefs
+	if len(refs) != 1 || refs[0] != target.calls[0].ref {
+		t.Fatalf("located dependency retained: %v", refs)
+	}
+	// Invalid input identity is still rejected, rather than blindly uploaded.
+	if e = os.WriteFile(filepath.Join(dir, ref.Path), []byte("corrupt"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	target = &recordingPublishTarget{}
+	p = newPublisher(storage, config.RefLocations{"seed": dir}, target, nil)
+	p.materializeLocated = true
+	if _, e = p.Publish(ctx, path); e == nil {
+		t.Fatal("accepted corrupt dependency")
+	}
+}

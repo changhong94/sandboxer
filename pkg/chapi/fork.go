@@ -180,3 +180,22 @@ func (c Client) FrozenForkMemory(ctx context.Context) (ForkMemoryState, error) {
 	}
 	return result, nil
 }
+
+// CheckForkChild reports a vanished capture helper instead of waiting forever
+// for a completion file that it can no longer publish.
+func (c Client) CheckForkChild(ctx context.Context, id string) error {
+	var operations []ForkOperation
+	if err := c.forkJSON(ctx, "GET", "vm.fork-status", nil, &operations); err != nil {
+		return err
+	}
+	for _, op := range operations {
+		if op.ID != id {
+			continue
+		}
+		if op.State == "Failed" || op.State == "ChildExited" {
+			return fmt.Errorf("capture %s state=%s", id, op.State)
+		}
+		return nil
+	}
+	return fmt.Errorf("capture operation %s disappeared", id)
+}

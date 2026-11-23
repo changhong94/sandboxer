@@ -33,7 +33,7 @@ type checkpointDiff struct {
 	logicalSize int64
 	store       *versioned.Store
 	readMu      sync.Mutex
-	read        []byte
+	closed      bool
 }
 
 func (d *checkpointDiff) ReadAt(p []byte, off int64) (int, error)  { return d.store.ReadAt(p, off) }
@@ -44,8 +44,7 @@ func (d *checkpointDiff) err() error                               { return d.st
 func (d *checkpointDiff) Close() error {
 	d.readMu.Lock()
 	defer d.readMu.Unlock()
-	clear(d.read)
-	d.read = nil
+	d.closed = true
 	return d.store.Close()
 }
 
@@ -55,11 +54,15 @@ func (d *checkpointDiff) withDirectRead(length int, offset int64, consume func([
 	}
 	d.readMu.Lock()
 	defer d.readMu.Unlock()
-	if d.read == nil {
+	if d.closed {
 		return os.ErrClosed
 	}
-	p := d.read[:length]
-	defer clear(p)
+	// An idle prepared disk must not pin a maximum-sized read workspace.
+	// Borrow only the requested size, and clear it before returning it to the
+	// process pool. readMu still fences Close against the consuming callback.
+	scratch := acquireDiffScratch(length)
+	defer releaseDiffScratch(scratch)
+	p := scratch.buffer
 	if err := readFullAt(d.store, p, offset); err != nil {
 		return err
 	}
@@ -102,7 +105,7 @@ func checkpointStoreOptions(options diskOptions, size int64, path string) versio
 }
 
 func wrapCheckpointDiff(store *versioned.Store, path string) *checkpointDiff {
-	return &checkpointDiff{store: store, path: path, logicalSize: store.Size(), read: make([]byte, maxDiffScratchSize)}
+	return &checkpointDiff{store: store, path: path, logicalSize: store.Size()}
 }
 
 func openCheckpointDiff(path string, init DiffInit, options diskOptions) (diffBackend, *freshDiffInit, error) {

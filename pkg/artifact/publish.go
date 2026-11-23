@@ -65,6 +65,7 @@ type Publisher struct {
 	transientLocations map[string]bool
 	checkpointPins     *PinnedDiffCheckpoints
 	linkImmutableDisks bool
+	materializeLocated bool
 }
 
 type publishTarget interface {
@@ -402,7 +403,7 @@ func (p *Publisher) Publish(ctx context.Context, input string) (PublishResult, e
 	if err != nil {
 		return PublishResult{}, err
 	}
-	if opened, ok := stream.(*OpenedFile); ok && opened.Format() == FileFormatManifestBundle {
+	if opened, ok := stream.(*OpenedFile); ok && opened.Format() == FileFormatManifestBundle && !p.materializeLocated {
 		return p.publishBundle(ctx, rootRef, scope, childScope, opened)
 	}
 	sandboxRoot, sandboxErr := sandboxfile.Open(ctx, stream)
@@ -847,4 +848,21 @@ func ensurePublishDirectory(path string) error {
 		return errors.New("publish location must be a real directory, not a symlink or non-directory")
 	}
 	return nil
+}
+
+// WithMaterializedLocations returns a publisher that uploads located file
+// dependencies too. Input authorization and logical validation remain intact;
+// already remote Manifest references retain their content identity.
+func (p *Publisher) WithMaterializedLocations() (*Publisher, error) {
+	if p == nil {
+		return nil, errors.New("nil publisher")
+	}
+	if _, ok := p.target.(*manifestPublishTarget); !ok {
+		return nil, errors.New("materializing locations requires Manifest Store destination")
+	}
+	copy := *p
+	copy.materializeLocated = true
+	// A proof/cache from a previous partial publication must not skip traversal.
+	copy.diskMemo, copy.memoryMemo = nil, nil
+	return &copy, nil
 }
