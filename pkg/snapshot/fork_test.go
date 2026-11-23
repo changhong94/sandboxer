@@ -133,17 +133,18 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 			}
 			source, _ := sparse.NewSource(bytes.NewReader(bytes.Repeat([]byte{0x11}, 4096)), 4096, nil)
 			pin := &forkTestPin{Source: source}
-			created, deleted := "", false
+			created, deleted, opened := "", false, false
 			d := DiskDiff{
 				TemporaryCheckpoint: func(_ context.Context, id string) error { created = id; return nil },
 				OpenCheckpoint: func(_ context.Context, id string) (ExportView, error) {
 					if id != created || id == "" {
 						t.Fatal(id)
 					}
+					opened = true
 					return pin, nil
 				},
 				DeleteCheckpoint: func(_ context.Context, id string) error {
-					if !pin.closed || id != created {
+					if (opened && !pin.closed) || id != created {
 						t.Fatal("deleted before pin closed")
 					}
 					deleted = true
@@ -157,7 +158,7 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 			}
 			release, err := freezeForkInputs(context.Background(), &s)
 			if fail {
-				if err == nil || !pin.closed || !deleted {
+				if err == nil || opened || !deleted {
 					t.Fatal("failure leaked pin/checkpoint", err)
 				}
 				return
@@ -165,7 +166,7 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pin.closed || deleted {
+			if opened || pin.closed || deleted {
 				t.Fatal("early release")
 			}
 			view, err := s.Diffs[0].Export(context.Background())
@@ -175,8 +176,8 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 			if err := view.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if pin.closed {
-				t.Fatal("sink stole operation-owned pin")
+			if !pin.closed {
+				t.Fatal("sink did not release its reader pin")
 			}
 			if err := release(); err != nil {
 				t.Fatal(err)

@@ -30,8 +30,10 @@ func TestForkCommittedSnapshotPreservesReferencesOnCleanupFailure(t *testing.T) 
 	testForkSinkOutcome(t, nil)
 }
 
+var errForkReaderOpen = errors.New("injected reader open failure")
+
 func TestForkPersistenceFailureDoesNotReportSuccess(t *testing.T) {
-	for _, err := range []error{errors.New("injected storage failure"), context.Canceled} {
+	for _, err := range []error{errors.New("injected storage failure"), context.Canceled, errForkReaderOpen} {
 		t.Run(err.Error(), func(t *testing.T) { testForkSinkOutcome(t, err) })
 	}
 }
@@ -102,9 +104,17 @@ func testForkSinkOutcome(t *testing.T, persistenceErr error) {
 		Quiescer: q, PortableConfig: portable,
 		Diffs: []DiskDiff{{
 			TemporaryCheckpoint: func(context.Context, string) error { return nil },
-			OpenCheckpoint:      func(context.Context, string) (ExportView, error) { return borrowedForkSource{disk}, nil },
-			DeleteCheckpoint:    func(context.Context, string) error { deleted = true; return deletionErr },
-			SnapshotView:        func() (io.ReadSeeker, []sparse.Extent, error) { return bytes.NewReader(make([]byte, 4096)), nil, nil },
+			OpenCheckpoint: func(context.Context, string) (ExportView, error) {
+				if !resumed {
+					t.Fatal("reader opened before resume")
+				}
+				if persistenceErr == errForkReaderOpen {
+					return nil, persistenceErr
+				}
+				return borrowedForkSource{disk}, nil
+			},
+			DeleteCheckpoint: func(context.Context, string) error { deleted = true; return deletionErr },
+			SnapshotView:     func() (io.ReadSeeker, []sparse.Extent, error) { return bytes.NewReader(make([]byte, 4096)), nil, nil },
 		}},
 	}
 	out, err := Take(sources, sink, true)

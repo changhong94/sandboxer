@@ -23,7 +23,7 @@ Go SDK 提供 `runtime.Fork(ctx, ctl.Request{OutDir: directory})`，remote 使�
 ## 执行和一致性
 
 1. 复用原有捕获互斥、guest quiesce、stdio 排空、CH pause、后端 quiesce 和状态捕获。
-2. 在同一个冻结边界中，版本化磁盘复用上游 checkpoint 和不可变 reader pin，随后父沙箱写入由已有磁盘 CoW 隔离；保存结束关闭 pin 并删除临时 checkpoint。未启用版本化磁盘时保留独立复制回退。RAM Data 复制到匿名 memfd，优先使用内核直接复制，最多两个独立区间复制任务，全部结束后加写入/扩缩容封印。Hole/Zero/Data 区别保持不变。
+2. 在同一个冻结边界中，版本化磁盘创建上游 checkpoint，固定旧版本，随后父沙箱写入由已有磁盘 CoW 隔离；不可变 reader pin 等原沙箱恢复后、保存器实际读取时才打开，避免把读取元数据的等待放进暂停阶段。保存器关闭 pin，操作结束删除临时 checkpoint。未启用版本化磁盘时保留独立复制回退。RAM Data 复制到匿名 memfd，优先使用内核直接复制，最多两个独立区间复制任务，全部结束后加写入/扩缩容封印。Hole/Zero/Data 区别保持不变。
 3. 恢复后端、CH 和 guest MUX；应用完成 thaw 后继续执行。
 4. 普通 FileSink/BundleSink/IngestSink 从独立输入完成原有 S/E 快照保存，返回原有引用。
 5. 关闭临时 memfd、磁盘 pin，并清理临时 checkpoint；失败路径也回收这些资源。保存期间仍串行化该沙箱的捕获操作；没有新后台任务队列。

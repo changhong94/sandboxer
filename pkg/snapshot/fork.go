@@ -229,12 +229,10 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err erro
 			if e := d.TemporaryCheckpoint(ctx, id); e != nil {
 				return nil, fmt.Errorf("fork checkpoint disk %d: %w", i, e)
 			}
-			view, e := d.OpenCheckpoint(ctx, id)
-			if e != nil {
-				return nil, e
-			}
-			owned = append(owned, view.Close)
-			s.Diffs[i].Export = func(context.Context) (ExportView, error) { return borrowedForkSource{view}, nil }
+			// The retained checkpoint already forces CoW. Open its reader only
+			// when the sink runs, after guest resume; the sink owns that reader.
+			// Capture admission excludes deletion until release below.
+			s.Diffs[i].Export = func(ctx context.Context) (ExportView, error) { return d.OpenCheckpoint(ctx, id) }
 			continue
 		}
 		// Copy only this disk's upper layer. The existing sink still handles its

@@ -141,3 +141,29 @@ func TestTemporaryCheckpointProcessExit(t *testing.T) {
 		t.Fatalf("ids=%v err=%v", ids, err)
 	}
 }
+
+func TestTemporaryCheckpointProtectsWritesBeforeReaderOpens(t *testing.T) {
+	s, _ := newTestStore(t, 16, nil)
+	putPages(t, s, []uint64{0}, 1)
+	if err := s.TemporaryCheckpoint(ctx, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+	// The guest resumes before snapshot persistence opens its reader.
+	putPages(t, s, []uint64{0}, 2)
+	for i := 0; i < 3; i++ {
+		if _, err := s.GC(ctx, 128); err != nil {
+			t.Fatal(err)
+		}
+	}
+	v, err := s.Export(ctx, "temporary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	checkView(t, v, map[uint64][]byte{0: pageFor(0, 1)})
+	if err := s.DeleteCheckpoint(ctx, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+	putPages(t, s, []uint64{0}, 3)
+	checkView(t, v, map[uint64][]byte{0: pageFor(0, 1)})
+}
