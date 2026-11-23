@@ -228,6 +228,7 @@ type SnapDiskRef struct {
 	Slot              bool
 	DiffID            string
 	Checkpoint        func(context.Context, string) error
+	OpenCheckpoint    func(context.Context, string) (snapshot.ExportView, error)
 	DeleteCheckpoint  func(context.Context, string) error
 	DeleteCheckpoints func(context.Context, []string) error
 	ListCheckpoints   func(context.Context) ([]string, error)

@@ -104,6 +104,7 @@ type Sources struct {
 type DiskDiff struct {
 	DiffID           string
 	Checkpoint       func(context.Context, string) error
+	OpenCheckpoint   func(context.Context, string) (ExportView, error)
 	DeleteCheckpoint func(context.Context, string) error
 	WaitMaterialized func(context.Context) error
 	Export           func(context.Context) (ExportView, error)
@@ -272,7 +273,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		if err != nil {
 			return nil, err
 		}
-		defer release()
+		defer func() { retErr = errors.Join(retErr, release()) }()
 		s.Quiescer.Resume()
 		backendsResumed = true
 		if err := ch.Resume(); err != nil {

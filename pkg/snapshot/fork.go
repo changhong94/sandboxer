@@ -2,11 +2,15 @@ package snapshot
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
+	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
@@ -15,8 +19,9 @@ import (
 
 // frozenForkSource is an ephemeral, sealed copy, not a new snapshot format.
 // Keep the three-state map: an explicit Zero must never become an inherited Hole.
-// Version one intentionally copies Data while paused instead of installing a
-// write-fault handler or changing the VMM. Ordinary sinks own final persistence.
+// RAM Data is still copied while paused: a shared mutable memfd cannot safely
+// become an upstream frozen-memory holder while its VM continues writing.
+// Ordinary sinks own final persistence; the kernel-copy path adds no new format.
 type frozenForkSource struct {
 	*memorySource
 	file *os.File
@@ -28,7 +33,13 @@ type borrowedForkSource struct{ sparse.Source }
 
 func (borrowedForkSource) Close() error { return nil }
 
-func freezeForkSource(ctx context.Context, input sparse.Source) (_ *frozenForkSource, err error) {
+func freezeForkSource(ctx context.Context, input sparse.Source) (*frozenForkSource, error) {
+	return freezeForkSourceFD(ctx, input, -1)
+}
+
+// sourceFD, when supplied, must back input at identical byte offsets. Only RAM
+// uses this path; encrypted or layered disk sources always use their reader.
+func freezeForkSourceFD(ctx context.Context, input sparse.Source, sourceFD int) (_ *frozenForkSource, err error) {
 	if input.Size() > uint64(^uint64(0)>>1) {
 		return nil, errors.New("fork: source is too large")
 	}
@@ -46,9 +57,9 @@ func freezeForkSource(ctx context.Context, input sparse.Source) (_ *frozenForkSo
 		return nil, err
 	}
 	var runs []memoryRun
-	buf := make([]byte, 1<<20)
+	var copies []sparse.Run
 	for off := uint64(0); off < input.Size(); {
-		if err = ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		run, e := input.RunAt(off, input.Size()-off)
@@ -66,26 +77,50 @@ func freezeForkSource(ctx context.Context, input sparse.Source) (_ *frozenForkSo
 		}
 		if run.Kind() == sparse.Data {
 			for pos := off; pos < end; {
-				b := buf[:min(uint64(len(buf)), end-pos)]
-				n, e := run.ReadAt(ctx, b, pos-off)
-				if e != nil {
-					return nil, e
-				}
-				if n != len(b) {
-					return nil, io.ErrUnexpectedEOF
-				}
-				n, e = f.WriteAt(b, int64(pos))
-				if e != nil {
-					return nil, e
-				}
-				if n != len(b) {
-					return nil, io.ErrShortWrite
-				}
-				pos += uint64(n)
+				last := min(end, pos+(1<<20))
+				// Capture the original run: sparse.Source implementations need not
+				// support concurrent RunAt calls. Its frozen reads are immutable.
+				copies = append(copies, memoryRun{off: pos, end: last, kind: sparse.Data, read: func(ctx context.Context, b []byte, offset uint64) (int, error) {
+					return run.ReadAt(ctx, b, offset-run.Offset())
+				}})
+				pos = last
 			}
 		}
 		off = end
 	}
+	// Two disjoint RAM-copy workers bound resource use without changing the
+	// captured bytes or allowing any writer to resume before BOTH have joined.
+	workers := 1
+	if sourceFD >= 0 && len(copies) > 1 {
+		workers = 2
+	}
+	copyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			var scratch []byte
+			fdIn := sourceFD
+			for i := w; i < len(copies); i += workers {
+				if e := copyForkRun(copyCtx, copies[i], f, &fdIn, &scratch); e != nil {
+					errs[w] = e
+					cancel()
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if _, err = unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
 		return nil, err
 	}
@@ -109,24 +144,95 @@ func freezeForkSource(ctx context.Context, input sparse.Source) (_ *frozenForkSo
 	return s, nil
 }
 
+// copyForkRun uses explicit offsets; parallel workers never share a file cursor.
+func copyForkRun(ctx context.Context, run sparse.Run, file *os.File, sourceFD *int, scratch *[]byte) error {
+	for pos := run.Offset(); pos < run.End(); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if *sourceFD >= 0 {
+			in, out := int64(pos), int64(pos)
+			n, err := unix.CopyFileRange(*sourceFD, &in, int(file.Fd()), &out, int(run.End()-pos), 0)
+			if n > 0 {
+				pos += uint64(n)
+			}
+			if err == nil {
+				if n == 0 {
+					return io.ErrUnexpectedEOF
+				}
+				continue
+			}
+			if !errors.Is(err, unix.EXDEV) && !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EINVAL) {
+				return err
+			}
+			*sourceFD = -1
+			if pos == run.End() {
+				continue
+			}
+		}
+		if *scratch == nil {
+			*scratch = make([]byte, 1<<20)
+		}
+		b := (*scratch)[:min(uint64(len(*scratch)), run.End()-pos)]
+		n, err := run.ReadAt(ctx, b, pos-run.Offset())
+		if err != nil {
+			return err
+		}
+		if n != len(b) {
+			return io.ErrUnexpectedEOF
+		}
+		n, err = file.WriteAt(b, int64(pos))
+		if err != nil {
+			return err
+		}
+		if n != len(b) {
+			return io.ErrShortWrite
+		}
+		pos += uint64(n)
+	}
+	return nil
+}
+
 // Called only after guest quiesce, CH pause, backend quiesce and CH snapshot.
 // Every live byte source is detached before any writer is resumed. Returned
 // views last until all ordinary sink calls finish, including failure paths.
-func freezeForkInputs(ctx context.Context, s *Sources) (_ func(), err error) {
-	var owned []*frozenForkSource
-	release := func() {
-		for _, v := range owned {
-			_ = v.Close()
+func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err error) {
+	started := time.Now()
+	var owned []func() error
+	release := func() error {
+		var err error
+		for i := len(owned) - 1; i >= 0; i-- {
+			err = errors.Join(err, owned[i]())
 		}
+		owned = nil
+		return err
 	}
 	defer func() {
 		if err != nil {
-			release()
+			err = errors.Join(err, release())
 		}
 	}()
 	s.Diffs = append([]DiskDiff(nil), s.Diffs...)
 	for i, d := range s.Diffs {
 		if i > 0 && s.PortableConfig.Boot.Disks[i-1].Unbound() {
+			continue
+		}
+		if d.Checkpoint != nil && d.OpenCheckpoint != nil && d.DeleteCheckpoint != nil {
+			var nonce [16]byte
+			if _, e := rand.Read(nonce[:]); e != nil {
+				return nil, e
+			}
+			id := "fork-" + hex.EncodeToString(nonce[:])
+			if e := d.Checkpoint(ctx, id); e != nil {
+				return nil, fmt.Errorf("fork checkpoint disk %d: %w", i, e)
+			}
+			owned = append(owned, func() error { return d.DeleteCheckpoint(context.Background(), id) })
+			view, e := d.OpenCheckpoint(ctx, id)
+			if e != nil {
+				return nil, e
+			}
+			owned = append(owned, view.Close)
+			s.Diffs[i].Export = func(context.Context) (ExportView, error) { return borrowedForkSource{view}, nil }
 			continue
 		}
 		// Copy only this disk's upper layer. The existing sink still handles its
@@ -140,13 +246,17 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func(), err error) {
 		frozen, e := freezeForkSource(ctx, source)
 		closeErr := closeSource()
 		if frozen != nil {
-			owned = append(owned, frozen)
+			owned = append(owned, frozen.Close)
 		}
 		if e != nil || closeErr != nil {
 			return nil, errors.Join(e, closeErr)
 		}
 		s.Diffs[i].Export = func(context.Context) (ExportView, error) { return borrowedForkSource{frozen}, nil }
 	}
+	if s.Logf != nil {
+		s.Logf("fork freeze: disks_ms=%.3f", float64(time.Since(started))/float64(time.Millisecond))
+	}
+	memoryStarted := time.Now()
 	var source sparse.Source
 	if s.CaptureMemory != nil {
 		view, e := s.CaptureMemory(ctx)
@@ -173,11 +283,14 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func(), err error) {
 		source = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
 		s.MemoryLayout = func() ([]sparse.Extent, []sparse.Extent, error) { return holes, zeros, nil }
 	}
-	frozen, e := freezeForkSource(ctx, source)
+	frozen, e := freezeForkSourceFD(ctx, source, s.MemfdFD)
 	if e != nil {
 		return nil, e
 	}
-	owned = append(owned, frozen)
+	owned = append(owned, frozen.Close)
 	s.MemfdFD = int(frozen.file.Fd())
+	if s.Logf != nil {
+		s.Logf("fork freeze: memory_ms=%.3f", float64(time.Since(memoryStarted))/float64(time.Millisecond))
+	}
 	return release, nil
 }

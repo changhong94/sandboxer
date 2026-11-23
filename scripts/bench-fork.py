@@ -56,9 +56,9 @@ for mode in ['local','remote']:
   for i in range(args.iterations+1):
    before_value=f'{mode}-{i}-before';parent.py("import os; f=open('/fork-state','w'); f.write("+repr(before_value)+"); f.flush(); os.fsync(f.fileno()); f.close()")
    last=parent.ticks[-1];start=time.monotonic_ns();outdir=W/'snapshots'/mode/str(i)
-   args=[B/'sandbox-ctl','fork','--sandbox-id',parent.sid,'--run-root',run,'--json']
-   args+=['--output',outdir]if mode=='local'else['--upload']
-   result=json.loads(call(*args,timeout=120));end=time.monotonic_ns()
+   command=[B/'sandbox-ctl','fork','--sandbox-id',parent.sid,'--run-root',run,'--json']
+   command+=['--output',outdir]if mode=='local'else['--upload']
+   result=json.loads(call(*command,timeout=120));end=time.monotonic_ns()
    assert result['type']=='snapshot_done'
    assert any(start<t<end for t,_,_ in parent.ticks),'parent made no progress during save'
    parent.py("import os; f=open('/fork-state','w'); f.write('PARENT-AFTER'); f.flush(); os.fsync(f.fileno()); f.close()")

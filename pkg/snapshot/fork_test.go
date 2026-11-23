@@ -72,3 +72,121 @@ func TestForkShortReadCannotPublishFrozenInput(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestForkKernelCopyKeepsSparseFrozenRAM(t *testing.T) {
+	fd, err := unix.MemfdCreate("fork-input", unix.MFD_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := os.NewFile(uintptr(fd), "fork-input")
+	defer live.Close()
+	const size = 4 << 20
+	if err := live.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x72}, 2<<20)
+	if _, err := live.WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	src := &releasedMemorySource{fd: fd, size: size, holes: []sparse.Extent{{Offset: 2 << 20, Size: 2 << 20}}}
+	frozen, err := freezeForkSourceFD(context.Background(), src, fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frozen.Close()
+	if _, err := live.WriteAt(bytes.Repeat([]byte{0x33}, len(payload)), 0); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := frozen.ReadAt(context.Background(), got, 0); err != nil || !bytes.Equal(got, payload) {
+		t.Fatal("mutable RAM leaked into snapshot", err)
+	}
+	run, err := frozen.RunAt(2<<20, 2<<20)
+	if err != nil || run.Kind() != sparse.Hole {
+		t.Fatal("hole changed", run, err)
+	}
+	if _, err := frozen.file.WriteAt([]byte{1}, 0); !errors.Is(err, unix.EPERM) {
+		t.Fatal("snapshot not sealed", err)
+	}
+	if _, err := freezeForkSourceFD(context.Background(), src, 987654); !errors.Is(err, unix.EBADF) {
+		t.Fatal("bad source accepted", err)
+	}
+}
+
+type forkTestPin struct {
+	sparse.Source
+	closed bool
+}
+
+func (p *forkTestPin) Close() error { p.closed = true; return nil }
+
+func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "RAM failure"}[fail], func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "ram")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if err := f.Truncate(4096); err != nil {
+				t.Fatal(err)
+			}
+			source, _ := sparse.NewSource(bytes.NewReader(bytes.Repeat([]byte{0x11}, 4096)), 4096, nil)
+			pin := &forkTestPin{Source: source}
+			created, deleted := "", false
+			d := DiskDiff{
+				Checkpoint: func(_ context.Context, id string) error { created = id; return nil },
+				OpenCheckpoint: func(_ context.Context, id string) (ExportView, error) {
+					if id != created || id == "" {
+						t.Fatal(id)
+					}
+					return pin, nil
+				},
+				DeleteCheckpoint: func(_ context.Context, id string) error {
+					if !pin.closed || id != created {
+						t.Fatal("deleted before pin closed")
+					}
+					deleted = true
+					return nil
+				},
+				Export: func(context.Context) (ExportView, error) { t.Fatal("active disk was copied"); return nil, nil },
+			}
+			s := Sources{MemfdFD: int(f.Fd()), MemfdSize: 4096, Diffs: []DiskDiff{d}}
+			if fail {
+				s.MemfdFD = 987654
+			}
+			release, err := freezeForkInputs(context.Background(), &s)
+			if fail {
+				if err == nil || !pin.closed || !deleted {
+					t.Fatal("failure leaked pin/checkpoint", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pin.closed || deleted {
+				t.Fatal("early release")
+			}
+			view, err := s.Diffs[0].Export(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := view.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if pin.closed {
+				t.Fatal("sink stole operation-owned pin")
+			}
+			if err := release(); err != nil {
+				t.Fatal(err)
+			}
+			if !pin.closed || !deleted {
+				t.Fatal("not released")
+			}
+			if err := release(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
