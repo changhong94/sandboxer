@@ -89,6 +89,8 @@ type Response struct {
 	Checkpoints     []DiffCheckpointRef `json:"checkpoints,omitempty"`
 	CheckpointCount int                 `json:"checkpoint_count,omitempty"`
 
+	// CleanupWarning does not invalidate the successfully committed snapshot.
+	CleanupWarning string `json:"cleanup_warning,omitempty"`
 	// Fork timing includes guest quiesce through successful application thaw.
 	ForkPauseMs float64 `json:"fork_pause_ms,omitempty"`
 	ForkSaveMs  float64 `json:"fork_save_ms,omitempty"`

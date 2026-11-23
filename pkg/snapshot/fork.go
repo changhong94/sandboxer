@@ -217,16 +217,18 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err erro
 		if i > 0 && s.PortableConfig.Boot.Disks[i-1].Unbound() {
 			continue
 		}
-		if d.Checkpoint != nil && d.OpenCheckpoint != nil && d.DeleteCheckpoint != nil {
+		if d.TemporaryCheckpoint != nil && d.OpenCheckpoint != nil && d.DeleteCheckpoint != nil {
 			var nonce [16]byte
 			if _, e := rand.Read(nonce[:]); e != nil {
 				return nil, e
 			}
 			id := "fork-" + hex.EncodeToString(nonce[:])
-			if e := d.Checkpoint(ctx, id); e != nil {
+			// Creation can commit before reporting an I/O error. Register cleanup first;
+			// the durable temporary flag also covers process death and failed cleanup.
+			owned = append(owned, func() error { return d.DeleteCheckpoint(context.Background(), id) })
+			if e := d.TemporaryCheckpoint(ctx, id); e != nil {
 				return nil, fmt.Errorf("fork checkpoint disk %d: %w", i, e)
 			}
-			owned = append(owned, func() error { return d.DeleteCheckpoint(context.Background(), id) })
 			view, e := d.OpenCheckpoint(ctx, id)
 			if e != nil {
 				return nil, e

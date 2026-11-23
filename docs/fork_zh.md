@@ -87,3 +87,23 @@ sudo python3 scripts/test-fork-guest.py \
 运行目录使用 `--run-root` 下的随机子目录，默认父目录 `/run/kuasar-fork-tests`。正常结束和异常退出都会尝试关闭自己创建的实例及 Store，
 不通过进程名批量杀进程，也不重启现有服务。失败返回非零退出码，`summary.json` 保留错误和清理状态；强制终止不算清理验证成功。
 该套测试不验证网卡身份隔离或宿主断电恢复。大量重复计时请使用前述 `scripts/bench-fork.py`。
+
+### 失败与清理语义
+
+fork 使用的磁盘 checkpoint 带有持久化的临时标记，标记和 checkpoint
+在同一事务中提交。正常结束时关闭 reader pin 并删除临时 checkpoint；
+即使创建返回 I/O 错误，也尝试清理，因为事务可能已提交。
+若进程退出或清理失败，重新打开该磁盘时只撤销有临时标记的 checkpoint，
+交给已有 GC 回收；普通用户 checkpoint 不受影响，仍存活的 reader pin
+继续保护其数据。没有增加后台任务队列或重试服务。
+
+只有快照持久化、发布及原有校验均成功后，临时资源清理失败才作为
+`cleanup_warning` 返回，此时快照引用仍有效；CLI 同时在 stderr 打印警告。
+持久化失败或取消仍返回错误，不作为成功快照报告。fork 的 JSON 字段保持
+原样，但与普通 snapshot 共用响应类型和快照引用的校验。
+
+对应故障回归测试为 `pkg/snapshot/fork_cleanup_test.go` 和
+`pkg/diffstore/internal/versioned/temporary_checkpoint_test.go`，覆盖提交后 I/O
+错误、保存中取消、存储写入失败、清理失败、进程未执行 Close 就退出，以及
+重新打开磁盘后 reader pin 仍保持 CoW 隔离。CLI 的空引用和错误响应类型由
+`cmd/sandbox-ctl/fork_test.go` 检查。

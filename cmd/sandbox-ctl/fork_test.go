@@ -1,10 +1,12 @@
 package main
 
 import (
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,7 +34,7 @@ func TestForkCLISelectsNormalLocalOrRemoteSinkAndAlwaysResumes(t *testing.T) {
 				if ctl.ReadMessage(c, &r) == nil {
 					got <- r
 				}
-				_ = ctl.WriteMessage(c, ctl.Response{Type: ctl.TypeSnapshotDone})
+				_ = ctl.WriteMessage(c, ctl.Response{Type: ctl.TypeSnapshotDone, SnapshotRef: "manifest://" + strings.Repeat("1", 64), SandboxRef: "manifest://" + strings.Repeat("2", 64), SnapshotManifestKey: strings.Repeat("1", 64)})
 			}()
 			args := []string{"--sandbox-id", "sid", "--run-root", root, "--resume=false"}
 			if remote {
@@ -46,6 +48,27 @@ func TestForkCLISelectsNormalLocalOrRemoteSinkAndAlwaysResumes(t *testing.T) {
 			r := <-got
 			if r.Type != ctl.TypeForkRequest || !r.ResumeAfter || r.Upload != remote || r.CheckpointID != "" || r.DropCachesEnabled() {
 				t.Fatalf("fork contract: %+v", r)
+			}
+		})
+	}
+}
+
+func TestForkCaptureValidation(t *testing.T) {
+	valid := ctl.Response{Type: ctl.TypeSnapshotDone, SnapshotRef: "manifest://" + strings.Repeat("1", 64), SandboxRef: "manifest://" + strings.Repeat("2", 64)}
+	for _, test := range []struct {
+		name     string
+		response ctl.Response
+		ok       bool
+	}{
+		{"valid", valid, true},
+		{"empty", ctl.Response{Type: ctl.TypeSnapshotDone}, false},
+		{"wrong-type", ctl.Response{Type: ctl.TypeExportDone, SnapshotRef: valid.SnapshotRef, SandboxRef: valid.SandboxRef}, false},
+		{"missing-sandbox", ctl.Response{Type: ctl.TypeSnapshotDone, SnapshotRef: valid.SnapshotRef}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := captureReport(test.response, artifact.RoleSnapshot)
+			if (err == nil) != test.ok {
+				t.Fatal(err)
 			}
 		})
 	}

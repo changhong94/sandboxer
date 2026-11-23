@@ -179,6 +179,15 @@ func snapshotOrForkCmd(args []string, fork bool) int {
 	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {
 		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
 	}
+	if fork {
+		if _, err := captureReport(resp, artifact.RoleSnapshot); err != nil {
+			fmt.Fprintf(os.Stderr, "fork: invalid runtime result: %v\n", err)
+			return 1
+		}
+		if resp.CleanupWarning != "" {
+			fmt.Fprintf(os.Stderr, "fork: snapshot saved; cleanup warning: %s\n", resp.CleanupWarning)
+		}
+	}
 	if *jsonOutput {
 		if fork {
 			// These legacy fields measure the pause RPC and sink work, not the

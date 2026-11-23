@@ -102,16 +102,17 @@ type Sources struct {
 // re-export), is the parent's already-resolved, scheme-qualified local overlay
 // ref this disk's delta is flattened onto (replace, not stack).
 type DiskDiff struct {
-	DiffID           string
-	Checkpoint       func(context.Context, string) error
-	OpenCheckpoint   func(context.Context, string) (ExportView, error)
-	DeleteCheckpoint func(context.Context, string) error
-	WaitMaterialized func(context.Context) error
-	Export           func(context.Context) (ExportView, error)
-	Path             string
-	Owned            bool
-	MergeBase        string
-	SnapshotView     func() (io.ReadSeeker, []sparse.Extent, error)
+	DiffID              string
+	TemporaryCheckpoint func(context.Context, string) error
+	Checkpoint          func(context.Context, string) error
+	OpenCheckpoint      func(context.Context, string) (ExportView, error)
+	DeleteCheckpoint    func(context.Context, string) error
+	WaitMaterialized    func(context.Context) error
+	Export              func(context.Context) (ExportView, error)
+	Path                string
+	Owned               bool
+	MergeBase           string
+	SnapshotView        func() (io.ReadSeeker, []sparse.Extent, error)
 	// WaitReady resolves transient writable-diff initialization before the VM is paused.
 	WaitReady func(context.Context) error
 	// CheckError rechecks asynchronous COW failures, including after the last read.
@@ -122,10 +123,11 @@ type DiskDiff struct {
 // (scheme-qualified file ref | manifest://<key>); Path is the local file (file mode
 // only, "" for upload). The handler maps these into the ctl.Response.
 type Outputs struct {
-	SnapshotRef  string
-	SnapshotPath string
-	SandboxRef   string
-	SandboxPath  string
+	CleanupWarning string // committed snapshot remains valid if temporary cleanup fails
+	SnapshotRef    string
+	SnapshotPath   string
+	SandboxRef     string
+	SandboxPath    string
 
 	MemorySize uint64
 	// MemoryResident is explicit logical memory coverage (Data plus Zero),
@@ -144,7 +146,7 @@ type Outputs struct {
 // Caller responsibility: create/remove StagingDir and transfer ownership of a
 // sink (FileSink for --output, IngestSink for --upload, or BundleSink). Take
 // closes it on every return path.
-func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr error) {
+func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retErr error) {
 	frozenCommitted := false
 	defer func() {
 		if frozenCommitted && retErr != nil {
@@ -273,7 +275,18 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		if err != nil {
 			return nil, err
 		}
-		defer func() { retErr = errors.Join(retErr, release()) }()
+		defer func() {
+			cleanupErr := release()
+			if cleanupErr == nil {
+				return
+			}
+			if retErr == nil && result != nil {
+				result.CleanupWarning = cleanupErr.Error()
+				logf("fork: snapshot committed; temporary cleanup failed: %v", cleanupErr)
+			} else {
+				retErr = errors.Join(retErr, cleanupErr)
+			}
+		}()
 		s.Quiescer.Resume()
 		backendsResumed = true
 		if err := ch.Resume(); err != nil {

@@ -135,7 +135,7 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 			pin := &forkTestPin{Source: source}
 			created, deleted := "", false
 			d := DiskDiff{
-				Checkpoint: func(_ context.Context, id string) error { created = id; return nil },
+				TemporaryCheckpoint: func(_ context.Context, id string) error { created = id; return nil },
 				OpenCheckpoint: func(_ context.Context, id string) (ExportView, error) {
 					if id != created || id == "" {
 						t.Fatal(id)

@@ -2067,6 +2067,7 @@ func handleSnapshotRequest(
 	}
 
 	resp = ctl.Response{
+		CleanupWarning:   out.CleanupWarning,
 		ForkPauseMs:      forkPauseMs,
 		MemorySize:       out.MemorySize,
 		MemoryResident:   out.MemoryResident,
