@@ -238,13 +238,20 @@ func (t *transaction) put(root, key, value uint64, depth int) ([]entry, error) {
 		t.nodes[slot] = node{leaf: true, entries: []entry{{key, value}}}
 		return []entry{{key, slot}}, nil
 	}
-	n, err := readNode(t, root)
-	if err != nil {
-		return nil, err
-	}
-	slot, err := t.writable(root, n)
-	if err != nil {
-		return nil, err
+	// Nodes already in this transaction are private writable copies. Reuse
+	// their entry storage instead of copying the whole leaf for every page.
+	n, owned := t.nodes[root]
+	slot := root
+	if !owned {
+		var err error
+		n, err = readNode(t, root)
+		if err != nil {
+			return nil, err
+		}
+		slot, err = t.writable(root, n)
+		if err != nil {
+			return nil, err
+		}
 	}
 	i := sort.Search(len(n.entries), func(i int) bool { return n.entries[i].key >= key })
 	if n.leaf {
@@ -263,11 +270,13 @@ func (t *transaction) put(root, key, value uint64, depth int) ([]entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		replacement := make([]entry, 0, len(n.entries)+1)
-		replacement = append(replacement, n.entries[:i]...)
-		replacement = append(replacement, children...)
-		replacement = append(replacement, n.entries[i+1:]...)
-		n.entries = replacement
+		if len(children) == 1 {
+			n.entries[i] = children[0]
+		} else {
+			n.entries = append(n.entries, entry{})
+			copy(n.entries[i+len(children):], n.entries[i+1:])
+			copy(n.entries[i:], children)
+		}
 	}
 	if len(n.entries) <= maxEntries {
 		t.nodes[slot] = n
@@ -278,7 +287,7 @@ func (t *transaction) put(root, key, value uint64, depth int) ([]entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	t.nodes[slot] = node{n.leaf, n.entries[:mid]}
+	t.nodes[slot] = node{n.leaf, n.entries[:mid:mid]}
 	t.nodes[right] = node{n.leaf, n.entries[mid:]}
 	return []entry{{n.entries[mid-1].key, slot}, {n.entries[len(n.entries)-1].key, right}}, nil
 }
@@ -463,8 +472,16 @@ func (s *Store) writePages(ctx context.Context, pages []Page, deferSpaceFailure 
 	if err := s.MarkModified(ctx); err != nil {
 		return err
 	}
-	for start := 0; start < len(pages); start += MaxBatchPages {
-		part := pages[start:min(start+MaxBatchPages, len(pages))]
+	smallBatch := false
+	for start := 0; start < len(pages); {
+		end := min(start+MaxBatchPages, len(pages))
+		// One cache window owns at most 256 frozen pages. Coalesce metadata
+		// within that existing bound; redo preflight and reservation rollback
+		// allow retry at the original 64-page size before any data is published.
+		if deferSpaceFailure && !smallBatch {
+			end = min(start+4*MaxBatchPages, len(pages))
+		}
+		part := pages[start:end]
 		s.mu.Lock()
 		if err := s.healthy(ctx); err != nil {
 			s.mu.Unlock()
@@ -481,6 +498,10 @@ func (s *Store) writePages(ctx context.Context, pages []Page, deferSpaceFailure 
 				s.mu.Unlock()
 				return err
 			}
+		}
+		redoBudget := 0
+		if len(part) > MaxBatchPages {
+			redoBudget = maxLogPages
 		}
 		err := s.mutateWithReservationPolicy(ctx, func(t *transaction) error {
 			// Last write to a repeated block wins within this bounded batch.
@@ -502,15 +523,14 @@ func (s *Store) writePages(ctx context.Context, pages []Page, deferSpaceFailure 
 				if err := s.validatePayloadRange(ctx, checked[i], checked[j-1]+1); err != nil {
 					return err
 				}
+				// Publish only this frozen window; seal each presence run once.
+				t.setPresenceRange(checked[i], checked[j-1]+1)
 				i = j
 			}
 			// Reserve the batch's data slots before allocating any B+ pages. This
 			// keeps unrelated logical pages physically adjacent whenever possible.
 			var mappings []entry
 			for _, block := range order {
-				if err := t.setPresence(block); err != nil {
-					return err
-				}
 				slot, err := lookup(t, t.ctrl.Root, block)
 				if err != nil {
 					return err
@@ -543,14 +563,22 @@ func (s *Store) writePages(ctx context.Context, pages []Page, deferSpaceFailure 
 				}
 			}
 			return nil
-		}, 0, deferSpaceFailure)
+		}, redoBudget, deferSpaceFailure)
 		if deferSpaceFailure && s.fatal == nil && spaceReservation(err) {
 			err = &SpacePressureError{Err: err}
 		}
 		s.mu.Unlock()
+		var budget *discardRedoBudget
+		if (errors.As(err, &budget) || IsSpacePressure(err)) && len(part) > MaxBatchPages {
+			// No Data/redo was published: preflight failed or reservation rolled back.
+			smallBatch = true
+			continue
+		}
 		if err != nil {
 			return err
 		}
+		start = end
+		smallBatch = false
 	}
 	return nil
 }

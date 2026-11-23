@@ -96,13 +96,15 @@ func TestWritePagesForCacheCommittedPrefixCanReplay(t *testing.T) {
 	want := map[uint64][]byte{1000: pageFor(1000, 1)}
 	for i := uint64(0); i < 2*MaxBatchPages; i++ {
 		old = append(old, i+1)
-		pages = append(pages, Page{512 + i, pageFor(512+i, 3)})
+		pages = append(pages, Page{512 + 2*i, pageFor(512+2*i, 3)})
 		want[i+1] = pageFor(i+1, 2)
 	}
 	putPages(t, s, old, 2)
 	before := s.Stats()
+	largeReservation := true
 	s.beforeIO = func(stage string) error {
-		if stage == "reserve" && s.stats.DataWritten-before.DataWritten >= MaxBatchPages*PageSize && s.stats.GCFreed == before.GCFreed {
+		if stage == "reserve" && (largeReservation || s.stats.DataWritten-before.DataWritten >= MaxBatchPages*PageSize) && s.stats.GCFreed == before.GCFreed {
+			largeReservation = false
 			return unix.ENOSPC
 		}
 		return nil

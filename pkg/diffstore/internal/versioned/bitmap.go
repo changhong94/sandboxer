@@ -43,6 +43,67 @@ func loadPresence(read func(uint64) ([]byte, error), size int64) ([]byte, error)
 	return bitmap, nil
 }
 
+// loadPresenceFile reads the contiguous active bitmap in one bounded direct
+// I/O instead of one I/O per encoded page. The caller holds the metadata lock
+// (or the exclusive owner after redo replay). Read-only views must prefer the
+// authenticated committed redo image over home pages, exactly as View.read.
+// No raw page slices are retained after decoding, nor added to the page cache.
+func loadPresenceFile(f *os.File, overlay map[uint64][]byte, size int64, stats *Stats) ([]byte, error) {
+	pages := presence.Pages(size)
+	if pages <= 0 || pages > 259 {
+		return nil, fmt.Errorf("diffstore: invalid presence capacity")
+	}
+	raw, err := readPresenceFileSpan(f, overlay, presenceAreaPage, pages)
+	if err != nil {
+		return nil, err
+	}
+	if stats != nil {
+		stats.IndexRead += uint64(len(raw))
+	}
+	return loadPresence(func(page uint64) ([]byte, error) {
+		offset := int(page-presenceAreaPage) * PageSize
+		return raw[offset : offset+PageSize], nil
+	}, size)
+}
+
+// Redo can contain newly allocated bitmap pages whose home offsets have not
+// been written yet. Read only runs absent from redo, so a valid committed
+// image never depends on an absent/torn home page (and never hides a missing
+// home page that has no committed replacement).
+func readPresenceFileSpan(f *os.File, overlay map[uint64][]byte, page uint64, count int) ([]byte, error) {
+	if count <= 0 || count > 259 {
+		return nil, fmt.Errorf("diffstore: invalid bitmap span")
+	}
+	if len(overlay) == 0 {
+		return directRead(f, count*PageSize, int64(page)*PageSize)
+	}
+	raw := make([]byte, count*PageSize)
+	for i := 0; i < count; {
+		if b, ok := overlay[page+uint64(i)]; ok {
+			if len(b) != PageSize {
+				return nil, fmt.Errorf("diffstore: invalid redo bitmap page")
+			}
+			copy(raw[i*PageSize:], b)
+			i++
+			continue
+		}
+		end := i + 1
+		for end < count {
+			if _, ok := overlay[page+uint64(end)]; ok {
+				break
+			}
+			end++
+		}
+		b, err := directRead(f, (end-i)*PageSize, int64(page+uint64(i))*PageSize)
+		if err != nil {
+			return nil, err
+		}
+		copy(raw[i*PageSize:end*PageSize], b)
+		i = end
+	}
+	return raw, nil
+}
+
 // PresenceBitmap returns a private complete logical-presence snapshot. Pending
 // frontend writes are deliberately absent; only committed store state is read.
 func (s *Store) PresenceBitmap(ctx context.Context) ([]byte, error) {
@@ -155,13 +216,18 @@ func (t *transaction) snapshotPresence() (uint64, error) {
 	return head, nil
 }
 
-func readSnapshotPresence(read func(uint64) ([]byte, error), cp checkpoint, size int64, next uint64) ([]byte, error) {
+// Descriptor links are validated under the same metadata lock before batching
+// adjacent bitmap payload pages. Fragmented chains remain supported; no gap or
+// unrelated data page is read. Every decoded page retains its checksum/index
+// validation, including committed redo overlays supplied by the view.
+func readSnapshotPresence(read func(uint64) ([]byte, error), cp checkpoint, size int64, next uint64, spans ...func(uint64, int) ([]byte, error)) ([]byte, error) {
 	if cp.BitmapDone != 0 {
 		return nil, fmt.Errorf("diffstore: checkpoint bitmap is being reclaimed")
 	}
 	bitmap := make([]byte, presence.Bytes(size))
+	pages := make([]uint64, presence.Pages(size))
 	slot := cp.Bitmap
-	for i := 0; i < presence.Pages(size); i++ {
+	for i := range pages {
 		if slot == 0 || slot >= next {
 			return nil, fmt.Errorf("diffstore: invalid checkpoint bitmap link")
 		}
@@ -176,20 +242,38 @@ func readSnapshotPresence(read func(uint64) ([]byte, error), cp checkpoint, size
 		if le.Uint64(b[o:]) != cp.Epoch || le.Uint64(b[o+16:]) != kindBitmap {
 			return nil, fmt.Errorf("diffstore: checkpoint bitmap ownership mismatch")
 		}
-		following := le.Uint64(b[o+8:])
-		b, err = read(slotPage(slot))
-		if err != nil {
-			return nil, err
-		}
-		part, err := presence.Decode(b, size, i)
-		if err != nil {
-			return nil, err
-		}
-		copy(bitmap[i*presence.PayloadSize:], part)
-		slot = following
+		pages[i] = slotPage(slot)
+		slot = le.Uint64(b[o+8:])
 	}
 	if slot != 0 {
 		return nil, fmt.Errorf("diffstore: excess checkpoint bitmap link")
+	}
+	for i := 0; i < len(pages); {
+		end := i + 1
+		var raw []byte
+		var err error
+		if len(spans) != 0 {
+			for end < len(pages) && pages[end] == pages[end-1]+1 {
+				end++
+			}
+			raw, err = spans[0](pages[i], end-i)
+		} else {
+			raw, err = read(pages[i])
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) != (end-i)*PageSize {
+			return nil, fmt.Errorf("diffstore: short bitmap span")
+		}
+		for j := i; j < end; j++ {
+			part, err := presence.Decode(raw[(j-i)*PageSize:(j-i+1)*PageSize], size, j)
+			if err != nil {
+				return nil, err
+			}
+			copy(bitmap[j*presence.PayloadSize:], part)
+		}
+		i = end
 	}
 	return bitmap, nil
 }

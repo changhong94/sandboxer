@@ -10,7 +10,7 @@ import (
 )
 
 // SpacePressureError is returned only by WritePagesForCache after an exhausted
-// ENOSPC/EDQUOT reservation. The failed 64-page transaction wrote no Data or
+// ENOSPC/EDQUOT reservation. The failed bounded transaction wrote no Data or
 // redo and its allocated-slot cleanup succeeded. Earlier Data batches and GC
 // assistance may have committed. The Store remains healthy; the cache must
 // either finish its bounded recovery protocol or enter its own sticky failure.
@@ -27,9 +27,9 @@ func IsSpacePressure(err error) bool {
 		(errors.Is(pressure.Err, unix.ENOSPC) || errors.Is(pressure.Err, unix.EDQUOT))
 }
 
-// WritePagesForCache uses the ordinary Data path and 64-page transactions, with
-// no new redo preflight or uniqueness map. A cache window has at most 256 full
-// Data pages. On SpacePressureError its caller keeps all buffers frozen, may
+// WritePagesForCache uses the ordinary Data path, coalescing an existing
+// frozen window of up to 256 pages after redo-budget preflight. Redo budget or
+// rolled-back reservation pressure retries with the original 64-page limit. On SpacePressureError its caller keeps all buffers frozen, may
 // commit an already accepted finite Zero cohort, and retries the same complete
 // Data window once. Reissuing a previously committed Data prefix is safe; no
 // operation in this window can independently discard another input page.

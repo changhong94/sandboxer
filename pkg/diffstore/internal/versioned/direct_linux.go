@@ -70,8 +70,19 @@ func directWrite(f *os.File, p []byte, off int64) error {
 	if off < 0 || off%PageSize != 0 {
 		return fmt.Errorf("diffstore: unaligned direct write")
 	}
-	return withDirectBuffer(len(p), func(b []byte) error {
-		copy(b, p)
+	return directWritePrepared(f, len(p), off, func(b []byte) error { copy(b, p); return nil })
+}
+
+// Prepare directly in the existing shared DIO buffer. No private Go-heap
+// payload copy is submitted to the kernel across a concurrent host fork.
+func directWritePrepared(f *os.File, size int, off int64, prepare func([]byte) error) error {
+	if off < 0 || off%PageSize != 0 {
+		return fmt.Errorf("diffstore: unaligned direct write")
+	}
+	return withDirectBuffer(size, func(b []byte) error {
+		if err := prepare(b); err != nil {
+			return err
+		}
 		n, err := directio.RetryInterruptedIO(unix.Pwrite, int(f.Fd()), b, off)
 		if err != nil {
 			return err

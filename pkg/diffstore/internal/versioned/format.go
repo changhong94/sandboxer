@@ -469,7 +469,7 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 		return fail(fmt.Errorf("diffstore: invalid control generation"))
 	}
 	s := &Store{file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages), metadataOnly: metadata}
-	s.presence, err = loadPresence(s.readPage, info.LogicalSize)
+	s.presence, err = loadPresenceFile(s.file, nil, info.LogicalSize, &s.stats)
 	if err != nil {
 		return fail(err)
 	}

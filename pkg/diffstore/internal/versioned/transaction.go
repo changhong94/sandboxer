@@ -195,13 +195,25 @@ func (t *transaction) read(page uint64) ([]byte, error) {
 	}
 	return t.store.readPage(page)
 }
+
+// edit owns a descriptor page after checking its stored checksum once.
+// Intermediate edits stay private; commit seals them before any disk IO.
 func (t *transaction) edit(page uint64) ([]byte, error) {
+	if page < slotAreaPage || (page-slotAreaPage)%(slotsPerGroup+1) != 0 {
+		return nil, fmt.Errorf("diffstore: not a descriptor page")
+	}
 	if b, ok := t.pages[page]; ok {
 		return b, nil
 	}
 	b, err := t.read(page)
 	if err != nil {
 		return nil, err
+	}
+	if err := checkPage(b); err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(b[:7], []byte("KDDESC4")) {
+		return nil, fmt.Errorf("diffstore: invalid descriptor page")
 	}
 	copyB := append([]byte(nil), b...)
 	t.pages[page] = copyB
@@ -211,12 +223,16 @@ func (t *transaction) desc(slot uint64) (descriptor, error) {
 	if slot == 0 || slot >= t.ctrl.Next {
 		return descriptor{}, fmt.Errorf("diffstore: slot %d out of bounds", slot)
 	}
-	b, err := t.read(descriptorPage(slot))
-	if err != nil {
-		return descriptor{}, err
-	}
-	if err = checkPage(b); err != nil {
-		return descriptor{}, err
+	b, owned := t.pages[descriptorPage(slot)]
+	if !owned {
+		var err error
+		b, err = t.read(descriptorPage(slot))
+		if err != nil {
+			return descriptor{}, err
+		}
+		if err = checkPage(b); err != nil {
+			return descriptor{}, err
+		}
 	}
 	o := descriptorOffset(slot)
 	return descriptor{le.Uint64(b[o:]), le.Uint64(b[o+8:]), le.Uint64(b[o+16:])}, nil
@@ -231,7 +247,6 @@ func (t *transaction) setDesc(slot uint64, d descriptor) error {
 	le.PutUint64(b[o:], d.Birth)
 	le.PutUint64(b[o+8:], d.Next)
 	le.PutUint64(b[o+16:], d.Kind)
-	sealPage(b)
 	return nil
 }
 func (t *transaction) allocate(kind uint64) (uint64, error) {
@@ -369,9 +384,6 @@ func (t *transaction) retirePayloads(slots []uint64) error {
 		if err != nil {
 			return err
 		}
-		if err := checkPage(b); err != nil {
-			return err
-		}
 		for _, slot := range slots[first:last] {
 			o := descriptorOffset(slot)
 			d := descriptor{le.Uint64(b[o:]), le.Uint64(b[o+8:]), le.Uint64(b[o+16:])}
@@ -400,7 +412,6 @@ func (t *transaction) retirePayloads(slots []uint64) error {
 			le.PutUint64(b[o+8:], d.Next)
 			le.PutUint64(b[o+16:], d.Kind)
 		}
-		sealPage(b)
 		first = last
 	}
 	if cpChanged {
@@ -415,6 +426,13 @@ func (t *transaction) commit() error {
 	s := t.store
 	for slot, n := range t.nodes {
 		t.pages[slotPage(slot)] = encodeNode(n)
+	}
+	// All descriptor edits are transaction-owned and checked on first import.
+	// Seal each page once, before reservation, data, or redo publication.
+	for page, data := range t.pages {
+		if page >= slotAreaPage && (page-slotAreaPage)%(slotsPerGroup+1) == 0 {
+			sealPage(data)
+		}
 	}
 	if len(t.pages) == 0 && t.ctrl == s.ctrl {
 		return t.writeData()
@@ -446,14 +464,8 @@ func (t *transaction) commit() error {
 	if err = t.writeData(); err != nil {
 		return err
 	}
-	for _, r := range newPages {
-		if err = s.hook("new-index"); err != nil {
-			return err
-		}
-		if err = writeFull(s.file, r.data, r.page); err != nil {
-			return err
-		}
-		s.stats.IndexWritten += PageSize
+	if err = t.writeIndexRecords(newPages, "new-index"); err != nil {
+		return err
 	}
 	if err = s.hook("redo-reset"); err != nil {
 		return err
@@ -503,14 +515,8 @@ func (t *transaction) commit() error {
 		return err
 	}
 	s.stats.RedoWritten += PageSize
-	for _, r := range existing {
-		if err = s.hook("apply"); err != nil {
-			return err
-		}
-		if err = writeFull(s.file, r.data, r.page); err != nil {
-			return err
-		}
-		s.stats.IndexWritten += PageSize
+	if err = t.writeIndexRecords(existing, "apply"); err != nil {
+		return err
 	}
 	if err = s.hook("redo-clear"); err != nil {
 		return err
@@ -571,28 +577,64 @@ func (t *transaction) reserve(newPages []record) error {
 func (t *transaction) writeData() error {
 	s := t.store
 	sort.Slice(t.data, func(i, j int) bool { return t.data[i].slot < t.data[j].slot })
+	type result struct {
+		size int
+		err  error
+	}
+	results := make(chan result, 3)
+	pending := 0
+	var first error
+	join := func() {
+		r := <-results
+		pending--
+		if r.err == nil {
+			s.stats.DataWritten += uint64(r.size)
+		} else if first == nil {
+			first = r.err
+		}
+	}
+	write := func(start, end int) error {
+		return directWritePrepared(s.file, (end-start)*PageSize, int64(slotPage(t.data[start].slot))*PageSize, func(b []byte) error {
+			for i := start; i < end; i++ {
+				dst := b[(i-start)*PageSize : (i-start+1)*PageSize]
+				copy(dst, t.data[i].data)
+				s.crypt(dst, t.data[i].block, true)
+			}
+			return nil
+		})
+	}
 	for start := 0; start < len(t.data); {
 		end := start + 1
 		for end < len(t.data) && slotPage(t.data[end].slot) == slotPage(t.data[end-1].slot)+1 {
 			end++
 		}
-		b := make([]byte, (end-start)*PageSize)
-		for i := start; i < end; i++ {
-			dst := b[(i-start)*PageSize : (i-start+1)*PageSize]
-			copy(dst, t.data[i].data)
-			s.crypt(dst, t.data[i].block, true)
+		if first != nil {
+			break
 		}
 		if err := s.hook("data"); err != nil {
-			return err
+			first = err
+			break
 		}
-		if err := writeFull(s.file, b, slotPage(t.data[start].slot)); err != nil {
-			return err
+		if start == 0 && end == len(t.data) { // Common single-run writes need no worker.
+			if err := write(start, end); err != nil {
+				return err
+			}
+			s.stats.DataWritten += uint64((end - start) * PageSize)
+			return nil
 		}
-		s.stats.DataWritten += uint64(len(b))
-		clear(b)
+		pending++
+		go func(a, b int) { results <- result{(b - a) * PageSize, write(a, b)} }(start, end)
+		if pending == 3 {
+			join()
+		}
 		start = end
 	}
-	return nil
+	// Even on a hook/IO failure, no metadata, rollback or buffer release can run
+	// while an earlier DIO request still references the reserved payload slots.
+	for pending > 0 {
+		join()
+	}
+	return first
 }
 func (s *Store) crypt(b []byte, block uint64, encrypt bool) {
 	sectorcrypt.Transform(s.cipher, b[:PageSize], block*(PageSize/sectorcrypt.UnitSize), encrypt)
@@ -650,4 +692,79 @@ func readRedo(f *os.File, stats *Stats, size int64) ([]record, error) {
 		out[i] = record{p, append([]byte(nil), body[i*PageSize:(i+1)*PageSize]...)}
 	}
 	return out, nil
+}
+
+// Metadata images in each phase address disjoint pages. Their ordering relative
+// to data, redo commit and redo clear is unchanged: join every submitted write
+// before advancing the phase or allowing rollback to punch reserved slots.
+// Three in-flight writes borrow the existing four-buffer process pool; no new
+// backing cache or persistent worker is allocated.
+func (t *transaction) writeIndexRecords(records []record, stage string) error {
+	s := t.store
+	if len(records) < 2 {
+		for _, r := range records {
+			if err := s.hook(stage); err != nil {
+				return err
+			}
+			if err := writeFull(s.file, r.data, r.page); err != nil {
+				return err
+			}
+			s.stats.IndexWritten += PageSize
+		}
+		return nil
+	}
+	type result struct {
+		pages int
+		err   error
+	}
+	results := make(chan result, 3)
+	pending := 0
+	var first error
+	join := func() {
+		r := <-results
+		pending--
+		if r.err == nil {
+			s.stats.IndexWritten += uint64(r.pages * PageSize)
+		} else if first == nil {
+			first = r.err
+		}
+	}
+	for start := 0; start < len(records); {
+		if first != nil {
+			break
+		}
+		end := start + 1
+		for end < len(records) && records[end].page == records[end-1].page+1 && (end-start+1)*PageSize <= directBufferSize {
+			end++
+		}
+		// Hooks and stats remain owned by the transaction goroutine. Adjacent
+		// metadata pages share one aligned IO; disjoint runs may overlap.
+		for i := start; i < end; i++ {
+			if err := s.hook(stage); err != nil {
+				first = err
+				break
+			}
+		}
+		if first != nil {
+			break
+		}
+		pending++
+		go func(a, b int) {
+			err := directWritePrepared(s.file, (b-a)*PageSize, int64(records[a].page)*PageSize, func(buf []byte) error {
+				for i := a; i < b; i++ {
+					copy(buf[(i-a)*PageSize:], records[i].data)
+				}
+				return nil
+			})
+			results <- result{b - a, err}
+		}(start, end)
+		if pending == 3 {
+			join()
+		}
+		start = end
+	}
+	for pending > 0 {
+		join()
+	}
+	return first
 }

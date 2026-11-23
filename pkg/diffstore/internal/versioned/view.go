@@ -158,7 +158,7 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 					return fail(err)
 				}
 				v.root = cp.Root
-				v.presence, err = readSnapshotPresence(v.read, cp, info.LogicalSize, ctrl.Next)
+				v.presence, err = readSnapshotPresence(v.read, cp, info.LogicalSize, ctrl.Next, v.readPresenceSpan)
 				if err != nil {
 					return fail(err)
 				}
@@ -172,7 +172,7 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 		}
 	}
 	if id == "" {
-		v.presence, err = loadPresence(v.read, info.LogicalSize)
+		v.presence, err = loadPresenceFile(v.file, v.overlay, info.LogicalSize, nil)
 		if err != nil {
 			return fail(err)
 		}
@@ -383,4 +383,10 @@ func (v *View) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
 		return done, io.EOF
 	}
 	return done, nil
+}
+
+// Called only while opening a view under the metadata lock. The redo overlay
+// is authoritative over home bytes and must be applied before decoding.
+func (v *View) readPresenceSpan(page uint64, count int) ([]byte, error) {
+	return readPresenceFileSpan(v.file, v.overlay, page, count)
 }
