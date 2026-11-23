@@ -274,7 +274,10 @@ func (s *Server) handle(conn *net.UnixConn) {
 		s.ExecHandler(conn, req)
 		return
 
-	case TypeSnapshotRequest, TypeCheckpointSnapshotRequest:
+	case TypeForkRequest, TypeSnapshotRequest, TypeCheckpointSnapshotRequest:
+		if req.Type == TypeForkRequest {
+			req.ResumeAfter = true
+		}
 		defer conn.Close()
 		if s.SnapshotHandler == nil {
 			code := ""

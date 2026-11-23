@@ -56,6 +56,8 @@ func main() {
 		os.Exit(checkpointCmd(os.Args[2:]))
 	case "reset":
 		os.Exit(resetCmd(os.Args[2:]))
+	case "fork":
+		os.Exit(forkCmd(os.Args[2:]))
 	case "snapshot":
 		os.Exit(snapshotCmd(os.Args[2:]))
 	case "export":
@@ -138,6 +140,9 @@ Usage:
                         [--mode local|bundle] [--manifest-config <path>]
                         [--ref-location name=file:///absolute/path ...]
                         [--timeout <sec>]
+  sandbox-ctl fork      --sandbox-id <sid> (--output <dir> | --upload) [--json]
+                        capture an ordinary snapshot and keep the original running
+
   sandbox-ctl snapshot  [--sandbox-id <sid>] [--path-id <leaf>]
                         (--output <out_dir> | --upload | --checkpoint <ID>)
                         [--mode local|bundle] [--resume]

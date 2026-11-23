@@ -89,6 +89,9 @@ type Response struct {
 	Checkpoints     []DiffCheckpointRef `json:"checkpoints,omitempty"`
 	CheckpointCount int                 `json:"checkpoint_count,omitempty"`
 
+	// Fork timing includes guest quiesce through successful application thaw.
+	ForkPauseMs float64 `json:"fork_pause_ms,omitempty"`
+	ForkSaveMs  float64 `json:"fork_save_ms,omitempty"`
 	// snapshot_done fields.
 	MemorySize          uint64                 `json:"memory_size,omitempty"`
 	MemoryResident      uint64                 `json:"memory_resident,omitempty"`
@@ -151,6 +154,7 @@ func (r Request) SnapshotMode() (string, error) {
 }
 
 const (
+	TypeForkRequest           = "fork_request"
 	TypeSnapshotRequest       = "snapshot_request"
 	TypeSnapshotDone          = "snapshot_done"
 	TypeExportRequest         = "export_request"

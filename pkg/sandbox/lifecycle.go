@@ -1101,6 +1101,13 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
+	if req.Type == ctl.TypeForkRequest {
+		if req.CheckpointID != "" || req.HostRetirement != nil {
+			return ctl.Response{}, errors.New("fork does not retire the VM or create a named local checkpoint")
+		}
+		req.ResumeAfter = true
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1539,6 +1546,13 @@ func handleSnapshotRequest(
 	memoryController *resctl.MemoryController,
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
+	forkStarted := time.Now()
+	defer func() {
+		if req.Type == ctl.TypeForkRequest && err == nil {
+			resp.ForkSaveMs = float64(time.Since(forkStarted)) / float64(time.Millisecond)
+		}
+	}()
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1934,6 +1948,8 @@ func handleSnapshotRequest(
 	if pinger != nil && pinger.Client != nil {
 		client = pinger.Client
 	}
+	forkPauseStart := time.Now()
+	var forkPauseMs float64
 	guestRecoveryRequired = true
 	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
 	if qerr != nil {
@@ -2012,6 +2028,18 @@ func handleSnapshotRequest(
 	if save != nil {
 		src.FrozenMemory = save.capture(opts, memoryParents, !mergeRef)
 	}
+	if req.Type == ctl.TypeForkRequest {
+		src.Fork = true
+		src.ResumeGuest = func() error {
+			if err := failRecovery(reattachRunningGuest("fork")); err != nil {
+				return err
+			}
+			forkPauseMs = float64(time.Since(forkPauseStart)) / float64(time.Millisecond)
+			guestQuiesced = false
+			logf("fork: original guest resumed pause_ms=%.3f", forkPauseMs)
+			return nil
+		}
+	}
 	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
 	if err != nil && errors.Is(err, snapshot.ErrFrozenMemoryCommitted) {
@@ -2039,6 +2067,7 @@ func handleSnapshotRequest(
 	}
 
 	resp = ctl.Response{
+		ForkPauseMs:      forkPauseMs,
 		MemorySize:       out.MemorySize,
 		MemoryResident:   out.MemoryResident,
 		WallclockPauseMs: out.WallclockPauseMs,

@@ -1534,6 +1534,14 @@ func (r *Runtime) Snapshot(ctx context.Context, req ctl.Request) (ctl.Response, 
 	return r.capture(ctx, req, false)
 }
 
+// Fork captures an independent ordinary snapshot while the original runtime
+// continues. It returns after the configured sink finishes, not at VM resume.
+func (r *Runtime) Fork(ctx context.Context, req ctl.Request) (ctl.Response, error) {
+	req.Type = ctl.TypeForkRequest
+	req.ResumeAfter = true
+	return r.Snapshot(ctx, req)
+}
+
 // Export captures portable workload disk state without changing the format.
 func (r *Runtime) Export(ctx context.Context, req ctl.Request) (ctl.Response, error) {
 	return r.capture(ctx, req, true)

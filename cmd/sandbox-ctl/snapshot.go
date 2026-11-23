@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,8 +20,16 @@ import (
 // false (post-snapshot the sandbox is destroyed via /vm.shutdown).
 //
 // See docs/runtime.md#snapshot.
-func snapshotCmd(args []string) int {
-	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+func snapshotCmd(args []string) int { return snapshotOrForkCmd(args, false) }
+
+func forkCmd(args []string) int { return snapshotOrForkCmd(args, true) }
+
+func snapshotOrForkCmd(args []string, fork bool) int {
+	name := "snapshot"
+	if fork {
+		name = "fork"
+	}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
 	jsonOutput := fs.Bool("json", false, "emit the completed Snapshot S and Sandbox E references as JSON")
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (path fallback when --path-id is omitted)")
@@ -37,6 +46,13 @@ func snapshotCmd(args []string) int {
 
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if fork {
+		if *checkpoint != "" {
+			fmt.Fprintln(os.Stderr, "fork: named local checkpoints are not used by portable forks")
+			return 2
+		}
+		*resume = true
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "snapshot: unexpected positional arguments")
@@ -126,6 +142,9 @@ func snapshotCmd(args []string) int {
 		DropCaches:                  dropCaches,
 		MergeRef:                    mergeRef,
 	}
+	if fork {
+		req.Type = ctl.TypeForkRequest
+	}
 	req.HostRetirement, err = ctl.ParseHostRetirement(os.Getenv(ctl.HostRetirementEnvironment))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "snapshot: retirement permit: %v\n", err)
@@ -161,7 +180,26 @@ func snapshotCmd(args []string) int {
 		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
 	}
 	if *jsonOutput {
+		if fork {
+			// These legacy fields measure the pause RPC and sink work, not the
+			// application pause. Fork exposes its explicitly defined timings.
+			resp.WallclockPauseMs, resp.WallclockDumpMs = 0, 0
+			if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			return 0
+		}
 		return printCaptureJSON(resp, artifact.RoleSnapshot)
+	}
+	if fork {
+		fmt.Fprintf(os.Stderr, "fork saved: application_pause_ms=%.3f save_complete_ms=%.3f\n", resp.ForkPauseMs, resp.ForkSaveMs)
+		if *upload {
+			fmt.Println(resp.SnapshotManifestKey)
+		} else {
+			fmt.Println(resp.SnapshotRef)
+		}
+		return 0
 	}
 	if *upload {
 		// Match `manifest-ctl store --put-manifest`: stdout = manifest key,
