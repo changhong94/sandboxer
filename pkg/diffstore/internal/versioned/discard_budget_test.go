@@ -236,7 +236,8 @@ func TestDiscardActualRedoBudgetSplitsFragmentedRange(t *testing.T) {
 		}
 		return nil
 	}
-	if err := s.Discard(ctx, 0, MaxDiscardPages*PageSize); err != nil {
+	// Exercise the maximum format capacity, including v5 reservation growth.
+	if err := s.discardWithRedoBudget(ctx, 0, MaxDiscardPages*PageSize, maxLogPages); err != nil {
 		t.Fatal(err)
 	}
 	s.beforeIO = nil

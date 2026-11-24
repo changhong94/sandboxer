@@ -458,6 +458,9 @@ func (t *transaction) commit() error {
 	}
 	sort.Slice(newPages, func(i, j int) bool { return newPages[i].page < newPages[j].page })
 	sort.Slice(existing, func(i, j int) bool { return existing[i].page < existing[j].page })
+	if err = s.reserveRedo(len(existing)); err != nil {
+		return err
+	}
 	if err = t.reserve(newPages); err != nil {
 		return err
 	}
@@ -767,4 +770,20 @@ func (t *transaction) writeIndexRecords(records []record, stage string) error {
 		join()
 	}
 	return first
+}
+
+// Growth happens before payload/index writes or redo publication. A failure
+// remains an unpublished reservation failure; already reserved pages are kept.
+func (s *Store) reserveRedo(pages int) error {
+	if pages <= s.redoReservedPages {
+		return nil
+	}
+	if err := s.hook("reserve-redo"); err != nil {
+		return errors.Join(errReservation, err)
+	}
+	if err := directio.Reserve(int(s.file.Fd()), int64(logImagesPage)*PageSize, int64(pages)*PageSize); err != nil {
+		return errors.Join(errReservation, err)
+	}
+	s.redoReservedPages = pages
+	return nil
 }

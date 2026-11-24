@@ -34,6 +34,7 @@ const (
 	logIndexPages  = 3
 	logImagesPage  = logIndexPage + logIndexPages
 	maxLogPages    = logIndexPages * PageSize / 8
+	minRedoPages   = 256
 	slotAreaPage   = 2048
 	slotsPerGroup  = 128
 	descriptorSize = 24
@@ -187,7 +188,7 @@ func createHeader(o Options) ([]byte, *xts.Cipher, error) {
 	}
 	b := make([]byte, PageSize)
 	copy(b, magic[:])
-	binary.BigEndian.PutUint16(b[8:], 4)
+	binary.BigEndian.PutUint16(b[8:], 5)
 	binary.BigEndian.PutUint16(b[10:], 16)
 	if o.Key != nil {
 		binary.BigEndian.PutUint32(b[12:], 1)
@@ -216,7 +217,7 @@ func validateInfo(i Info) error {
 	return nil
 }
 func parseHeader(b []byte, key *[32]byte, metadata bool) (Info, *xts.Cipher, error) {
-	if len(b) < 16 || !bytes.Equal(b[:8], magic[:]) || binary.BigEndian.Uint16(b[8:]) != 4 {
+	if len(b) < 16 || !bytes.Equal(b[:8], magic[:]) || (binary.BigEndian.Uint16(b[8:]) != 4 && binary.BigEndian.Uint16(b[8:]) != 5) {
 		return Info{}, nil, ErrFormat
 	}
 	if err := checkPage(b); err != nil {
@@ -338,7 +339,7 @@ func create(path string, o Options, asynchronous bool, beforeIO func(string) err
 	info, _, _ := parseHeader(h, nil, true)
 	// The initial committed presence is entirely zero. Still serialize all
 	// validated presence pages; only its in-memory allocation is deferred.
-	s := &Store{file: f, lock: lock,
+	s := &Store{file: f, lock: lock, compactRedo: true, redoReservedPages: minRedoPages,
 		lockPath: lockPath, info: info, cipher: xc, ctrl: control{Next: 1, Epoch: 1},
 		cache: newCache(cachePages), initDone: make(chan struct{}), beforeIO: beforeIO}
 	initialize := func() {
@@ -373,12 +374,13 @@ func (s *Store) initialize(h []byte) error {
 	if err := f.Truncate(slotAreaPage * PageSize); err != nil {
 		return err
 	}
-	// Redo and existing control home pages must remain writable even when guest
-	// data fills the filesystem. This fixed, bounded reservation is not payload.
+	// Emergency redo remains reserved for bounded metadata-only reclamation.
+	// Larger transactions reserve their redo before writing data or committing.
+	// Version 5 marks this policy so older writers reject the file.
 	if err := s.hook("initialize-reserve"); err != nil {
 		return err
 	}
-	if err := directio.Reserve(int(f.Fd()), 0, (logImagesPage+maxLogPages)*PageSize); err != nil {
+	if err := directio.Reserve(int(f.Fd()), 0, (logImagesPage+minRedoPages)*PageSize); err != nil {
 		return err
 	}
 	if err := writeFull(f, h, 0); err != nil {
@@ -424,6 +426,7 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 	if err != nil {
 		return fail(err)
 	}
+	compactRedo := binary.BigEndian.Uint16(b[8:]) == 5
 	info, xc, err := parseHeader(b, o.Key, metadata)
 	if err != nil {
 		return fail(err)
@@ -469,6 +472,11 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 		return fail(fmt.Errorf("diffstore: invalid control generation"))
 	}
 	s := &Store{file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages), metadataOnly: metadata}
+	s.compactRedo = compactRedo
+	s.redoReservedPages = maxLogPages
+	if s.compactRedo {
+		s.redoReservedPages = minRedoPages
+	}
 	s.presence, err = loadPresenceFile(s.file, nil, info.LogicalSize, &s.stats)
 	if err != nil {
 		return fail(err)

@@ -1539,3 +1539,24 @@ Issue; these workloads establish observations, not a universal speedup claim.
 [Runtime: start, control, capture and restore](runtime.md) | [Sandbox configuration reference](configuration.md) | [Sandbox and Snapshot artifacts](artifacts.md) | [Guest memory and lazy restore](memory.md) | [Resource control and usage accounting](resources.md) | [Guest ABI: boot, applications and host protocols](guest-abi.md) | [VMM integration and Cloud Hypervisor patches](vmm.md)
 
 [Component entry](../README.md) · [Native builds and patch materials](../native-deps/README.md)
+
+
+### Version 5 bounded redo reservation
+
+New persistent DIFF files use a version-5 header, with the same page layout and
+redo replay protocol as version 4. Readers accept both versions; older version-4
+writers reject version 5. Existing version-4 artifacts are not converted.
+
+Each new DIFF reserves 256 redo image pages (1 MiB), plus the existing journal
+control/index and presence metadata, instead of reserving the maximum 1536
+images (6 MiB). A larger transaction must reserve its entire required redo span
+before payload or index writes and before publishing a redo commit. Reservations
+are kept; reopening conservatively starts with the guaranteed minimum and can
+reserve already allocated larger spans again. Durability barriers are unchanged.
+
+Discard preflight bounds transactions by the guaranteed reserve and splits
+fragmented windows before mutation. Bounded garbage collection must still work
+without journal growth on a full filesystem. The tests cover fragmented retained
+versions, failed reservation, killed-writer replay, legacy reopen, and a real,
+isolated ext4 ENOSPC/reclamation cycle. This reduces fixed per-active-disk space;
+it does not deduplicate independent guest writes or move payload into RAM.

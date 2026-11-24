@@ -72,30 +72,33 @@ type Stats struct {
 }
 
 type Store struct {
-	mu            sync.Mutex
-	initDone      chan struct{} // nil for an already opened store; closed exactly once by its initializer
-	initErr       error         // immutable after initDone closes; separate from later runtime health
-	file          *os.File
-	lock          *os.File
-	lockPath      string
-	info          Info
-	cipher        *xts.Cipher
-	presence      []byte // committed logical presence; nil means all zero; protected by mu
-	ctrl          control
-	cache         *pageCache
-	stats         Stats
-	fatal         error
-	closed        bool
-	closedFlag    atomic.Bool
-	retiredFlag   atomic.Bool
-	fatalFlag     atomic.Pointer[storedError]
-	currentFlag   atomic.Uint64
-	gc            gcScan
-	gcDeletion    uint64
-	gcVersionTurn bool
-	metadataOnly  bool
-	stop          chan struct{}
-	done          chan struct{}
+	// Redo reservation high-water mark, protected by mu.
+	redoReservedPages int
+	compactRedo       bool
+	mu                sync.Mutex
+	initDone          chan struct{} // nil for an already opened store; closed exactly once by its initializer
+	initErr           error         // immutable after initDone closes; separate from later runtime health
+	file              *os.File
+	lock              *os.File
+	lockPath          string
+	info              Info
+	cipher            *xts.Cipher
+	presence          []byte // committed logical presence; nil means all zero; protected by mu
+	ctrl              control
+	cache             *pageCache
+	stats             Stats
+	fatal             error
+	closed            bool
+	closedFlag        atomic.Bool
+	retiredFlag       atomic.Bool
+	fatalFlag         atomic.Pointer[storedError]
+	currentFlag       atomic.Uint64
+	gc                gcScan
+	gcDeletion        uint64
+	gcVersionTurn     bool
+	metadataOnly      bool
+	stop              chan struct{}
+	done              chan struct{}
 	// beforeIO is deliberately package-private fault injection, installed before
 	// use by deterministic tests. A process-exit hook also exercises real reopen.
 	beforeIO func(stage string) error

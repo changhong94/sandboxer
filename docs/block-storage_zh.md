@@ -1206,3 +1206,19 @@ Discard 固定使用 4 MiB 范围和 1 MiB 缓存；
 [Runtime：启动、控制、捕获与恢复](runtime_zh.md) | [Sandbox 配置参考](configuration_zh.md) | [Sandbox 与 Snapshot 制品](artifacts_zh.md) | [Guest 内存与按需恢复](memory_zh.md) | [资源控制与 Usage 计量](resources_zh.md) | [Guest ABI：启动、应用与 Host 协议](guest-abi_zh.md) | [VMM 集成与 Cloud Hypervisor 补丁](vmm_zh.md)
 
 [组件入口](../README_zh.md) · [构建与补丁材料](../native-deps/README_zh.md)
+
+
+### v5 重做日志按需预留
+
+新建持久化 DIFF 使用 v5 文件头，页布局和重做恢复协议沿用 v4。新代码读取
+v4/v5；旧版 v4 写入器会拒绝 v5，已有 v4 制品不会自动转换。
+
+每个新磁盘保底预留 256 个重做镜像页（1 MiB），另保留原有控制、索引和存在性
+位图，不再一律预留最大 1536 页（6 MiB）。较大的事务必须在写入数据或索引、
+发布提交之前成功预留完整重做空间。已分配的预留不回收；重新打开时从保底值
+开始判断，可再次确认已分配的较大范围。所有持久化屏障保持不变。
+
+Discard 在修改前按保底日志容量检查并拆分碎片化请求。有限批次的垃圾回收必须
+在磁盘满时仍无需扩展日志即可推进。验证包括保留版本下的碎片化回收、预留
+失败、写进程中断后的恢复、v4 兼容及隔离 ext4 满盘回收。该改动减少每个活动
+磁盘的固定开销，不对独立写入做去重，也不将磁盘数据移到内存。

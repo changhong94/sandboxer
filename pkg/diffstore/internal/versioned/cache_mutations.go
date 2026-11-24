@@ -90,7 +90,7 @@ func (s *Store) DiscardPages(ctx context.Context, blocks []uint64) error {
 				i = j
 			}
 			return nil
-		}, maxLogPages)
+		}, s.discardRedoBudget())
 		s.mu.Unlock()
 		var budget *discardRedoBudget
 		if errors.As(err, &budget) && end-start > 1 {
@@ -103,4 +103,12 @@ func (s *Store) DiscardPages(ctx context.Context, blocks []uint64) error {
 		start, end = end, len(ordered)
 	}
 	return nil
+}
+
+// Discard uses guaranteed redo space, splitting sparse windows before mutation.
+func (s *Store) discardRedoBudget() int {
+	if s.compactRedo {
+		return minRedoPages
+	}
+	return maxLogPages
 }

@@ -681,11 +681,11 @@ func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
 // batches. The range must contain aligned complete pages. Retained versions
 // keep their protected records until independent deletion and GC can free them.
 func (s *Store) Discard(ctx context.Context, off, length int64) error {
-	return s.discardWithRedoBudget(ctx, off, length, maxLogPages)
+	return s.discardWithRedoBudget(ctx, off, length, s.discardRedoBudget())
 }
 
 // The budget argument lets deterministic tests exercise the same splitting
-// path with small fixtures; production always uses the on-disk redo capacity.
+// path with small fixtures; production uses its format-guaranteed reserved capacity.
 func (s *Store) discardWithRedoBudget(ctx context.Context, off, length int64, redoBudget int) error {
 	if redoBudget <= 0 || redoBudget > maxLogPages {
 		return fmt.Errorf("diffstore: invalid discard redo budget")

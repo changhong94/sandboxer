@@ -191,8 +191,13 @@ func TestDiscardPagesActualRedoBudgetSplits(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.beforeIO = nil
-	if len(images) != 2 || images[0] > maxLogPages || images[1] > maxLogPages || s.Err() != nil {
+	if len(images) < 2 || s.Err() != nil {
 		t.Fatal("unsafe Zero-window redo split", images, s.Err())
+	}
+	for _, pages := range images {
+		if pages > uint64(s.discardRedoBudget()) {
+			t.Fatal("redo exceeded reserved budget", pages)
+		}
 	}
 	checkActive(t, s, want)
 	if err := s.Close(); err != nil {

@@ -97,7 +97,7 @@ func (o diffEncryptionDiskOption) applyDisk(options *diskOptions) error {
 }
 
 // WithDiffEncryption makes active-diff reads policy-aware and encrypts every
-// fresh diff using customerKey: v3 by default, or v4 with WithCheckpoint.
+// fresh diff using customerKey: v3 by default, or v5 with WithCheckpoint.
 // required rejects existing
 // plaintext active diffs; it does not reject a plaintext template used only as
 // a provisioning input.

@@ -1,3 +1,3 @@
-// Package diffstore implements the local, multi-version v2 DIFF format.
+// Package versioned implements local multi-version v4/v5 DIFF storage.
 // It does not own sandbox lifecycle or directory-to-runtime routing.
 package versioned
