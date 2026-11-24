@@ -27,21 +27,32 @@ import (
 // ServeAndWait owns Wait. No guest RAM, disk or tenant credential is installed
 // until the controller's durable assignment and normal restore validation.
 type PreparedRestore struct {
-	preparedMAC string
-	preparedTAP string
-	mu          sync.Mutex
-	cmd         *exec.Cmd
-	runDir      string
-	transferred bool
-	closed      bool
-	cleanup     func()
-	tap, netns  *os.File
-	tapConfig   *config.TapFDConfig
-	tapMetadata tapfd.Metadata
-	gate        *tapfd.ForkGate
+	originRunDir string
+	layered      bool
+	preparedMAC  string
+	preparedTAP  string
+	mu           sync.Mutex
+	cmd          *exec.Cmd
+	runDir       string
+	transferred  bool
+	closed       bool
+	cleanup      func()
+	tap, netns   *os.File
+	tapConfig    *config.TapFDConfig
+	tapMetadata  tapfd.Metadata
+	gate         *tapfd.ForkGate
 }
 
 func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, retErr error) {
+	traceLast := time.Now()
+	trace := func(stage string) {
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			now := time.Now()
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=kvm run=%s stage=%s us=%d end_ns=%d\n", spec.SandboxID, stage, now.Sub(traceLast).Microseconds(), now.UnixNano())
+			traceLast = now
+		}
+	}
+
 	if !spec.PrivateRAMFork || spec.SandboxID == "" || spec.PathID != spec.SandboxID || filepath.Base(spec.PathID) != spec.PathID {
 		return nil, errors.New("prepared restore requires a private RAM identity")
 	}
@@ -55,6 +66,7 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 		return nil, fmt.Errorf("prepared host config: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "prepared restore host decoder duration=%s\n", time.Since(decoderStarted))
+	trace("decoder")
 	cfg := &config.SandboxConfig{Resources: spec.Resources}
 	size, err := cfg.CapacityMemoryBytes()
 	if err != nil {
@@ -77,6 +89,7 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 			_ = r.Close()
 		}
 	}()
+	trace("host_setup")
 	var ns *os.File
 	if spec.Network.TapFD != nil {
 		f, n, meta, e := tapfd.AcquireConfig(ctx, spec.Network.TapFD)
@@ -109,6 +122,7 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 		r.tap = nil
 
 	}
+	trace("tap_setup")
 	if err = os.Mkdir(filepath.Join(r.runDir, "snap-state"), 0700); err != nil {
 		return nil, err
 	}
@@ -130,6 +144,7 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 	if err = startCH(cmd, ns); err != nil {
 		return nil, err
 	}
+	trace("spawn")
 	r.cmd = cmd
 	// Only the readiness socket is polled; prepare itself is issued once.
 	wait, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -144,11 +159,13 @@ func PrepareRestore(ctx context.Context, spec RuntimeSpec) (_ *PreparedRestore, 
 		case <-time.After(time.Millisecond):
 		}
 	}
+	trace("socket_wait")
 	payload, _ := json.Marshal(map[string]any{"cpus": map[string]any{"boot_vcpus": spec.Resources.Capacity.CPU, "max_vcpus": spec.Resources.Capacity.CPU}, "memory": map[string]any{"size": size}, "payload": map[string]any{"kernel": strings.TrimPrefix(spec.Kernel, "file://")}})
 	started := time.Now()
 	if err = (chapi.Client{Sock: sock, RespDeadline: 10 * time.Second}).PrepareContext(wait, payload); err != nil {
 		return nil, err
 	}
+	trace("kvm_prepare")
 	fmt.Fprintf(os.Stderr, "prepared restore KVM ready pid=%d duration=%s run=%s\n", cmd.Process.Pid, time.Since(started), spec.SandboxID)
 	return r, nil
 }
@@ -219,7 +236,12 @@ func (r *PreparedRestore) Restore(ctx context.Context, runDir, stateDir string) 
 	if r.closed || r.transferred || filepath.Clean(runDir) != r.runDir {
 		return nil, errors.New("prepared restore ownership mismatch")
 	}
-	if err := (chapi.Client{Sock: filepath.Join(runDir, "ch.sock"), RespDeadline: 10 * time.Second}).RestoreCoWContext(ctx, "file://"+stateDir); err != nil {
+	client := chapi.Client{Sock: filepath.Join(runDir, "ch.sock"), RespDeadline: 10 * time.Second}
+	restore := client.RestoreCoWContext
+	if r.layered {
+		restore = client.RestoreOnDemandContext
+	}
+	if err := restore(ctx, "file://"+stateDir); err != nil {
 		return nil, err
 	}
 	r.transferred = true
@@ -265,6 +287,9 @@ func (r *PreparedRestore) close(removeDirectory bool) error {
 		r.netns = nil
 	}
 	r.cleanup()
+	if r.originRunDir != "" {
+		defer os.RemoveAll(r.originRunDir)
+	}
 	if !r.transferred && !removeDirectory {
 		err := os.Remove(filepath.Join(r.runDir, "ch.sock"))
 		if errors.Is(err, os.ErrNotExist) {
@@ -315,5 +340,57 @@ func ensurePreparedRuntimeRoot(path string) error {
 	if !st.IsDir() || st.Mode().Perm()&0022 != 0 || !ok || owner.Uid != uint32(os.Geteuid()) {
 		return errors.New("prepared runtime root must be an owned non-writable directory")
 	}
+	return nil
+}
+
+// RebindRestoreDirectory is called only after the assigned restore acquired
+// the target runtime identity. It moves no tenant state and never overwrites a
+// socket. The empty holder has not yet installed any guest RAM or devices.
+func (r *PreparedRestore) RebindRestoreDirectory(runDir string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.transferred {
+		return errors.New("prepared holder no longer owned")
+	}
+	if filepath.Clean(runDir) == r.runDir {
+		return nil
+	}
+	if r.originRunDir != "" || !filepath.IsAbs(runDir) || filepath.Dir(runDir) != filepath.Dir(r.runDir) {
+		return errors.New("invalid prepared restore directory transfer")
+	}
+	for _, dir := range []string{r.runDir, runDir} {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("restore directory is not an owned directory")
+		}
+	}
+	old := filepath.Join(r.runDir, "ch.sock")
+	target := filepath.Join(runDir, "ch.sock")
+	info, err := os.Lstat(old)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return errors.New("prepared API is not a socket")
+	}
+	// Keep the physical API name stable: CH rebuilds its HTTP listener there
+	// after native fork. Symlink creation is atomic and fails if target exists.
+	// Both parent directories remain owned until this holder exits.
+	if err := os.Symlink(old, target); err != nil {
+		return err
+	}
+	r.originRunDir, r.runDir = r.runDir, runDir
+	return nil
+}
+func (r *PreparedRestore) UseLayeredMemory() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.transferred {
+		return errors.New("prepared holder no longer owned")
+	}
+	r.layered = true
 	return nil
 }

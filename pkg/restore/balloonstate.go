@@ -50,6 +50,10 @@ func parseBalloonFromState(stateJSON []byte) (targetBytes, currentBytes uint64, 
 	if err := json.Unmarshal(stateJSON, &tree); err != nil {
 		return 0, 0, false, fmt.Errorf("state.json: %w", err)
 	}
+	return parseBalloonFromTree(&tree)
+}
+
+func parseBalloonFromTree(tree *chSnapshotTree) (targetBytes, currentBytes uint64, ok bool, err error) {
 	dm, ok2 := tree.Snapshots["device-manager"]
 	if !ok2 || dm == nil {
 		return 0, 0, false, nil

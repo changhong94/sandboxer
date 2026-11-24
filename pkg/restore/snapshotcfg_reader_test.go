@@ -148,12 +148,42 @@ func testSnapshotCfgProjection(t *testing.T, manifestCfg *config.ManifestConfig,
 			return nil
 		}
 	}
+	if len(deferred) > 1 && deferred[1] {
+		opts.RetainSources = true
+	}
 	document, err := reader.Read(ctx, input, opts)
 	if len(deferred) > 0 && deferred[0] && !resolved {
 		t.Fatal("paired E resolver was not called")
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+	if opts.RetainSources {
+		if document.Sources == nil {
+			t.Fatal("missing retained source capability")
+		}
+		defer document.Sources.Close()
+		if err := reader.Close(); err != nil {
+			t.Fatal(err)
+		}
+		p := document.Sources
+		if match, err := p.Matches(p.opts); err != nil || !match {
+			t.Fatal("source handoff rejected", err)
+		}
+		other := p.opts
+		other.CustomerKeyFn = func() ([32]byte, error) { return [32]byte{99}, nil }
+		if match, err := p.Matches(other); err != nil || match {
+			t.Fatal("cross tenant source capability", err)
+		}
+		if _, err := p.snapshot.Memory.ReadAt(ctx, make([]byte, 32), 0); err != nil {
+			t.Fatal("owner closed on handoff", err)
+		}
+		// Retention consumes the original reader; an independent read owns a
+		// new storage lifetime and must not close the retained streams.
+		reader, err = NewSnapshotCfgReader(manifestCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if !bytes.Equal(document.Raw, sCfgRaw) {
 		t.Fatalf("raw snapshot.cfg changed:\n%s\nwant:\n%s", document.Raw, sCfgRaw)
@@ -217,4 +247,10 @@ func TestSnapshotCfgReaderRejectsLegacyDiskSchema(t *testing.T) {
 
 func TestSnapshotCfgReaderResolvesNamedEAfterOpeningS(t *testing.T) {
 	testSnapshotCfgProjection(t, nil, nil, true, true)
+}
+
+func TestSnapshotCfgReaderRetainedSourcesOwnStorageAndAreKeyBound(t *testing.T) {
+	cfg := &config.ManifestConfig{}
+	cfg.Manifest.Key = strings.Repeat("2d", 32)
+	testSnapshotCfgProjection(t, cfg, nil, true, false, true)
 }

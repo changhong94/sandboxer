@@ -264,6 +264,7 @@ func (c *Disk) Checkpoint(ctx context.Context, id CheckpointID) error {
 		return err
 	}
 	c.opMu.Lock()
+	c.frontendUsed.Store(true)
 	defer c.opMu.Unlock()
 	if err := c.Err(); err != nil {
 		return err

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/bits"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
@@ -22,6 +23,7 @@ import (
 // access; the worker never acquires them. Reopen loads committed presence;
 // fresh owners establish an independent empty bitmap before accepting writes.
 type Disk struct {
+	frontendUsed atomic.Bool // disables initial-publication reuse after any frontend admission
 	durableFlush bool
 	opMu         sync.RWMutex // lifetime of frontend operations; never taken by writeback
 	lifeCtx      context.Context
@@ -620,6 +622,27 @@ func (c *Disk) WaitMaterialized(ctx context.Context) error {
 	}
 }
 
+// FlushPrepared reuses only a fresh writer's completed sync/rename/dirsync
+// certificate before its first frontend operation. Reopened, used or handed-off
+// writers retain normal Flush semantics. It never skips initial publication,
+// ignores its error, or treats an accepted cached write as already durable.
+func (c *Disk) FlushPrepared(ctx context.Context) error {
+	if err := c.WaitMaterialized(ctx); err != nil {
+		return err
+	}
+	c.opMu.Lock()
+	reusable := c.materialFresh != nil && !c.frontendUsed.Load()
+	err := c.Err()
+	c.opMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if reusable {
+		return nil
+	}
+	return c.Flush()
+}
+
 // Flush preserves the upstream health-only policy unless durable operation was
 // explicitly selected. Persistent fork runtimes select it for their v4 disks.
 func (c *Disk) Flush() error {
@@ -630,6 +653,7 @@ func (c *Disk) Flush() error {
 		return err
 	}
 	c.opMu.Lock()
+	c.frontendUsed.Store(true)
 	defer c.opMu.Unlock()
 	if err := c.Err(); err != nil {
 		return err
@@ -923,6 +947,9 @@ func (c *Disk) begin(ctx context.Context) (context.Context, func(), error) {
 		return nil, nil, ctx.Err()
 	}
 	c.opMu.RLock()
+	if !c.frontendUsed.Load() {
+		c.frontendUsed.Store(true)
+	}
 	if err := c.Err(); err != nil {
 		c.opMu.RUnlock()
 		return nil, nil, err
@@ -973,6 +1000,7 @@ func (c *Disk) close(discard bool) error {
 		}
 		c.cancel()
 		c.opMu.Lock()
+		c.frontendUsed.Store(true)
 		c.opMu.Unlock()
 
 		if c.materialCancel != nil {

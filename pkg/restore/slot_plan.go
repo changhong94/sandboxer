@@ -98,7 +98,28 @@ func syncStageDir(path string) error {
 // It prepares authenticated metadata, bounded resident template extents and
 // independent durable empty CoW writers. No full guest RAM copy, template VM
 // or guest command is run.
-func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.RuntimeSpec, files map[string]StageFileVersion, preparedTap ...string) (retErr error) {
+func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.RuntimeSpec, files map[string]StageFileVersion, preparedTap ...string) error {
+	return p.stageForSlot(ctx, spec, files, false, preparedTap...)
+}
+
+// StageForSlotAsyncReceipt overlaps only the binding receipt's durability with
+// subsequent independent catalog work. WaitSlotDurable must precede Ready;
+// take and Close also join the barrier, so a pending/failed receipt cannot be
+// consumed or removed by another path.
+func (p *PreparedSources) StageForSlotAsyncReceipt(ctx context.Context, spec sandbox.RuntimeSpec, files map[string]StageFileVersion, preparedTap ...string) error {
+	return p.stageForSlot(ctx, spec, files, true, preparedTap...)
+}
+
+func (p *PreparedSources) stageForSlot(ctx context.Context, spec sandbox.RuntimeSpec, files map[string]StageFileVersion, asyncReceipt bool, preparedTap ...string) (retErr error) {
+	traceLast := time.Now()
+	trace := func(stage string) {
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			now := time.Now()
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=slot run=%s stage=%s us=%d end_ns=%d\n", spec.SandboxID, stage, now.Sub(traceLast).Microseconds(), now.UnixNano())
+			traceLast = now
+		}
+	}
+
 	<-p.done
 	if p.err != nil {
 		return p.err
@@ -113,6 +134,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	if p.sandbox.Root.Checkpoint != nil {
 		return errors.New("catalog staging requires immutable published Sandbox")
 	}
+	trace("source_ready")
 	started := time.Now()
 	host := &config.SandboxConfig{Resources: spec.Resources, Timeouts: spec.Timeouts, Usage: spec.Usage, Boot: config.BootConfig{Runtime: spec.Bundle}, Network: config.NetworkConfig{TAP: spec.Network.TAP, MAC: spec.Network.MAC, TapFD: spec.Network.TapFD}}
 	host.ApplyDefaults()
@@ -138,6 +160,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	if cfg.Resources.Capacity.CPU != spec.Resources.Capacity.CPU {
 		return errors.New("catalog CPU shape differs from generic slot")
 	}
+	trace("shape")
 	runtime, err := ResolveRuntimeBinding(ctx, host.Boot.Runtime, c0.Boot.Runtime)
 	if err != nil {
 		return err
@@ -145,6 +168,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	if err = config.BindPortableDiskGraph(cfg, p.sandbox.RuntimeRef, p.sandbox.RelativeDir); err != nil {
 		return err
 	}
+	trace("runtime_binding")
 	base := sandbox.DefaultBaseDir(spec.BaseRoot, spec.PathID)
 	if err = os.MkdirAll(base, 0700); err != nil {
 		return err
@@ -159,6 +183,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 			os.RemoveAll(dir)
 		}
 	}()
+	trace("stage_dir")
 	owner, err := diffstore.LockDirectory(filepath.Join(base, "checkpoint"))
 	if err != nil {
 		return err
@@ -172,6 +197,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	if err != nil {
 		return err
 	}
+	trace("dependencies")
 	plan.disk, err = sandbox.PrepareCheckpointDiskPlan(cfg, bases, owner.Directory, nil)
 	if err != nil {
 		return err
@@ -204,9 +230,11 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	opts.checkpointPlan = plan.disk
 	opts.checkpointOwner = owner
 	opts.borrowedDiskSource = p.sandbox
+	trace("disk_plan")
 	if err = preflightRestoreDiskGraphUncached(ctx, cfg, opts, p.sandbox.RelativeDir, p.key); err != nil {
 		return err
 	}
+	trace("preflight")
 	cache, err := diffstore.NewCache(diffstore.DefaultCacheSize, diffstore.DefaultMaxDirtySize)
 	if err != nil {
 		return err
@@ -225,16 +253,15 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 			retErr = errors.Join(retErr, closeDisks())
 		}
 	}()
+	trace("reconstruct")
 	for _, disk := range backends {
 		if disk.Cow != nil {
-			if err = disk.Cow.WaitMaterialized(ctx); err != nil {
-				return err
-			}
-			if err = disk.Cow.Flush(); err != nil {
+			if err = disk.Cow.FlushPrepared(ctx); err != nil {
 				return err
 			}
 		}
 	}
+	trace("disk_flush")
 	plan.backends, plan.cleanup, plan.cache = backends, closeDisks, cache
 	for _, d := range plan.disk.Disks {
 		if d.Path != "" {
@@ -251,6 +278,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 	if err = syncStageDir(owner.Directory); err != nil {
 		return err
 	}
+	trace("disk_dir_sync")
 	runDir := filepath.Join(spec.RuntimeRoot, spec.PathID)
 	rewrite := pathRewrite{UffdSocket: filepath.Join(runDir, "uffd.sock"), APISock: filepath.Join(runDir, "ch.sock"), VsockSock: filepath.Join(runDir, "vsock.sock"), RuntimePath: runtime}
 	for _, root := range plan.graph {
@@ -287,6 +315,7 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 			return err
 		}
 	}
+	trace("state_rewrite")
 	if p.image != nil {
 		p.image.close()
 		p.image = nil
@@ -306,22 +335,41 @@ func (p *PreparedSources) StageForSlot(ctx context.Context, spec sandbox.Runtime
 		return err
 	}
 	_, err = f.Write(raw)
-	if err == nil {
-		err = f.Sync()
-	}
-	err = errors.Join(err, f.Close())
 	if err != nil {
-		return err
+		return errors.Join(err, f.Close())
 	}
-	if err = syncStageDir(dir); err != nil {
+	receiptStart := time.Now()
+	p.stageReceipt = startSlotReceipt(func() error {
+		err := errors.Join(f.Sync(), f.Close())
+		if err == nil {
+			err = syncStageDir(dir)
+		}
+		if err == nil {
+			err = syncStageDir(base)
+		}
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=receipt run=%s stage=durable us=%d end_ns=%d\n", spec.SandboxID, time.Since(receiptStart).Microseconds(), time.Now().UnixNano())
+		}
 		return err
-	}
-	if err = syncStageDir(base); err != nil {
-		return err
+	})
+	// Join before any of the older error-cleanup defers release disks/directories.
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, p.WaitSlotDurable())
+		}
+	}()
+	if !asyncReceipt {
+		if err = p.WaitSlotDurable(); err != nil {
+			return err
+		}
+		trace("receipt_sync")
+	} else {
+		trace("receipt_submitted")
 	}
 	if err = p.stageTemplateMemory(ctx, spec.RuntimeRoot, cap); err != nil {
 		return err
 	}
+	trace("template_memory")
 	p.slotPlan = plan
 	log.Printf("slot restore plan prepared duration=%s disks=%d", time.Since(started), len(plan.disk.Disks))
 	return nil

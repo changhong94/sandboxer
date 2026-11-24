@@ -73,42 +73,45 @@ func servePrivatePages(ctx context.Context, conn net.Conn, source uffd.SnapshotR
 }
 func servePrivatePagesWithPlan(ctx context.Context, conn net.Conn, source uffd.SnapshotReader, size uint64, local *privateLocalPlan) error {
 	var zeros [][2]uint64
-	for off := uint64(0); off < size; {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		run, err := source.RunAt(off, size-off)
-		if err != nil {
-			return err
-		}
-		if run == nil || run.Offset() != off || run.End() <= off || run.End() > size {
-			return fmt.Errorf("invalid private page layout")
-		}
-		if run.Kind() == sparse.Zero || run.Kind() == sparse.Hole {
-			if len(zeros) > 0 && zeros[len(zeros)-1][0]+zeros[len(zeros)-1][1] == off {
-				zeros[len(zeros)-1][1] += run.End() - off
-			} else {
-				zeros = append(zeros, [2]uint64{off, run.End() - off})
+	if local != nil {
+		zeros = local.zeros
+	} else {
+		for off := uint64(0); off < size; {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
+			run, err := source.RunAt(off, size-off)
+			if err != nil {
+				return err
+			}
+			if run == nil || run.Offset() != off || run.End() <= off || run.End() > size {
+				return fmt.Errorf("invalid private page layout")
+			}
+			if run.Kind() == sparse.Zero || run.Kind() == sparse.Hole {
+				if len(zeros) > 0 && zeros[len(zeros)-1][0]+zeros[len(zeros)-1][1] == off {
+					zeros[len(zeros)-1][1] += run.End() - off
+				} else {
+					zeros = append(zeros, [2]uint64{off, run.End() - off})
+				}
+			}
+			off = run.End()
 		}
-		off = run.End()
 	}
 	if len(zeros) > 1<<20 {
 		return fmt.Errorf("too many zero ranges")
 	}
-	var hello [16]byte
-	binary.LittleEndian.PutUint64(hello[:8], size)
-	binary.LittleEndian.PutUint64(hello[8:], uint64(len(zeros)))
-	if _, err := io.Copy(conn, bytes.NewReader(hello[:])); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for _, extent := range zeros {
-		var wire [16]byte
-		binary.LittleEndian.PutUint64(wire[:8], extent[0])
-		binary.LittleEndian.PutUint64(wire[8:], extent[1])
-		if _, err := io.Copy(conn, bytes.NewReader(wire[:])); err != nil {
-			return err
-		}
+	hello := make([]byte, 16+16*len(zeros))
+	binary.LittleEndian.PutUint64(hello[:8], size)
+	binary.LittleEndian.PutUint64(hello[8:16], uint64(len(zeros)))
+	for i, e := range zeros {
+		binary.LittleEndian.PutUint64(hello[16+16*i:], e[0])
+		binary.LittleEndian.PutUint64(hello[24+16*i:], e[1])
+	}
+	if _, err := io.Copy(conn, bytes.NewReader(hello)); err != nil {
+		return err
 	}
 	if local != nil {
 		if err := local.send(conn); err != nil {

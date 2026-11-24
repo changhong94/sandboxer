@@ -111,6 +111,7 @@ type Options struct {
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
 
+	validatedDiskLayers      *preflightLayers     // request-owned immutable handles shared after validation
 	borrowedDiskSource       *openedSandboxSource // owned by Run until all disk backends close
 	checkpointReleaseSources func() error         // temporary source pins; writers own the handoff
 }
@@ -164,7 +165,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 		var lines strings.Builder
 		for _, p := range phases {
-			fmt.Fprintf(&lines, "[restore timing] phase=%s elapsed=%s start_ns=%d end_ns=%d pid=%d start_tid=%d end_tid=%d process_cpu_ns=%d\n", p.name, p.end.Sub(p.start), p.start.UnixNano(), p.end.UnixNano(), os.Getpid(), p.startTID, p.endTID, p.processCPU)
+			fmt.Fprintf(&lines, "[restore timing] sid=%s phase=%s elapsed=%s start_ns=%d end_ns=%d pid=%d start_tid=%d end_tid=%d process_cpu_ns=%d\n", opts.SandboxID, p.name, p.end.Sub(p.start), p.start.UnixNano(), p.end.UnixNano(), os.Getpid(), p.startTID, p.endTID, p.processCPU)
 		}
 		log.Print(lines.String())
 		phases = phases[:0]
@@ -324,6 +325,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
+	markRestore("runtime_identity")
 	snapCfg.Boot.Runtime = "file://" + runtimePath
 	if c0.IsCheckpoint() {
 		err = config.BindCheckpointDiskGraph(&snapCfg, sandboxSource.RelativeDir)
@@ -334,6 +336,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("Sandbox source binding: %w", err)
 	}
 
+	markRestore("disk_graph_binding")
 	stagedDisks := false
 	if opts.EnableCheckpoint {
 		stagedDisks, err = opts.PreparedSources.adoptSlotDisksForPortable(&snapCfg, c0, sandboxSource.PortableRef, &opts)
@@ -354,14 +357,39 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			}
 		}
 	}
-	if !stagedDisks {
-		if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey); err != nil {
-			return -1, fmt.Errorf("restore disk graph preflight: %w", err)
+	markRestore("disk_branch_prepare")
+	// Reuse the exact immutable handles validated by preflight. The request's
+	// source scope is fixed here; no global/tenant-crossing cache is involved.
+	// The validation join precedes reconstruction, and every borrower closes
+	// before this owner, including on failed admission or VM launch.
+	layerOptions := opts
+	opts.validatedDiskLayers = newPreflightLayers(func(raw string) (fetch.Stream, error) {
+		return openDiskRefStream(ctx, raw, layerOptions)
+	})
+	defer func() {
+		retErr = errors.Join(retErr, opts.validatedDiskLayers.Close())
+		if retErr != nil {
+			code = -1
 		}
-
+	}()
+	// The read-only disk check is independent of the memory/topology checks
+	// below. Neither path mutates this disk graph. Join before any runtime
+	// publication or VM launch, including on an early validation error.
+	waitDiskPreflight := func() error { return nil }
+	if !stagedDisks {
+		preflightConfig, preflightOptions := snapCfg, opts
+		waitDiskPreflight = startRestorePreflight(ctx, func(checkCtx context.Context) error {
+			return preflightRestoreDiskGraph(checkCtx, &preflightConfig, preflightOptions, sandboxSource.RelativeDir, diffCustomerKey)
+		})
+		defer func() {
+			retErr = errors.Join(retErr, waitDiskPreflight())
+			if retErr != nil {
+				code = -1
+			}
+		}()
 	}
 	markRestore("runtime_binding")
-	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore] "+format, a...) }
+	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore sid="+opts.SandboxID+"] "+format, a...) }
 	startUnixNs := time.Now().UnixNano()
 	runtimeMemoryRef := root.selfRef
 	selfRef := runtimeMemoryRef
@@ -446,6 +474,13 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, err
 	}
 	snapCap, privateRAM := shape.Capacity, shape.Private
+	// A persisted private-RAM snapshot also needs provider identity rewriting,
+	// even when this request is a resume rather than a live fork. Prepare only
+	// JSON here; the allocated TAP identity and gate are still checked below.
+	if privateRAM && preparedNetwork == nil {
+		preparedNetwork = startForkNetworkRewrite(snapshotRoot.ConfigJSON, snapshotRoot.StateJSON, snapCfg.Network.MAC)
+		defer preparedNetwork.Wait()
+	}
 	balTarget, balCurrent, balOk := shape.BalloonTarget, shape.BalloonCurrent, shape.Balloon
 	markRestore("topology_validation")
 	settledHeadroom, err := snapCfg.AllocatableMemoryBytes()
@@ -469,7 +504,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// exact streams for the later UFFD chain so validation and use cannot race a
 	// second lookup of the same ref.
 	markRestore("balloon_validation")
-	parentMemoryLayers, err := openMemoryParentLayers(ctx, memoryConfig.FromRefs, opts, snapCap)
+	parentMemoryLayers, err := openMemoryParentLayersCached(ctx, memoryConfig.FromRefs, opts, snapCap, privateRAM)
 	if err != nil {
 		return -1, err
 	}
@@ -508,12 +543,21 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, fmt.Errorf("rewrite config.json: %w", err)
 	}
 	markRestore("rewrite_config")
+	if err := waitDiskPreflight(); err != nil {
+		return -1, fmt.Errorf("restore disk graph preflight: %w", err)
+	}
+	markRestore("disk_preflight_join")
 	identity, err := runidentity.Acquire(runDir, opts.SandboxID)
 	if err != nil {
 		return -1, fmt.Errorf("restore runtime identity: %w", err)
 	}
 	defer identity.Close()
 	defer identity.RemoveRunDir()
+	if opts.PreparedRestore != nil {
+		if err := opts.PreparedRestore.RebindRestoreDirectory(runDir); err != nil {
+			return -1, err
+		}
+	}
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return -1, err
 	}
@@ -582,6 +626,54 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// (no from_refs) degenerates to today's behaviour. Parent streams were
 	// opened during preflight and live until run exit; selfStream is root-owned.
 	markRestore("reservation")
+	cacheSize, maxDirtySize, err := snapCfg.Resources.DiffCOW.Bytes()
+	if err != nil {
+		return -1, err
+	}
+	idleAfter, err := snapCfg.Resources.DiffCOW.CacheIdleDuration()
+	if err != nil {
+		return -1, err
+	}
+	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize, idleAfter)
+	if err != nil {
+		return -1, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, cowCache.Close())
+		if retErr != nil {
+			code = -1
+		}
+	}()
+	defer stopCache()
+	markRestore("disk_cache")
+	var disks []sandbox.DiskBackend
+	var cleanupDisks func() error
+	var diskErr error
+	diskDone := make(chan struct{})
+	diskOptions, diskConfig := opts, snapCfg
+	go func() {
+		defer close(diskDone)
+		started := time.Now()
+		var reused bool
+		disks, cleanupDisks, reused, diskErr = diskOptions.PreparedSources.takeSlotBackends(ctx, cowCache)
+		if diskErr == nil && !reused {
+			disks, cleanupDisks, diskErr = reconstructRestoreDisks(ctx, diskOptions, diffCustomerKey, &diskConfig, logf, cowCache)
+		}
+		logf("disk reconstruction complete duration=%s error=%v", time.Since(started), diskErr)
+	}()
+	// Wait before every ownership release, even if independent memory setup
+	// fails. No VM is launched until both preparations have succeeded.
+	defer func() {
+		<-diskDone
+		retErr = errors.Join(retErr, diskErr)
+		if cleanupDisks != nil {
+			retErr = errors.Join(retErr, cleanupDisks())
+		}
+		if retErr != nil {
+			code = -1
+		}
+	}()
+	markRestore("disk_reconstruct_launch")
 	capBytes := snapCap
 	memLayers := make([]fetch.Stream, 1, 1+len(parentMemoryLayers))
 	memLayers[0] = selfStream
@@ -596,6 +688,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		fingerprint := sha256.Sum256(key[:])
 		clear(key[:])
 		for i, ref := range memoryConfig.FromRefs {
+			if _, alreadyCached := memLayers[i+1].(*templateComparison); alreadyCached {
+				continue
+			}
 			cached, cacheErr := cachedComparisonMemory(ctx, opts.RuntimeRoot, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"), fmt.Sprintf("%s:%x:%d", ref, fingerprint, capBytes), capBytes)
 			if cacheErr != nil {
 				return -1, cacheErr
@@ -652,14 +747,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}
 	}
 	if opts.PreparedRestore != nil && !templateMemory {
-		// Keep restore compatibility when the bounded memory cache is full or
-		// the snapshot has layered memory. Release only the empty holder;
-		// durable disks, validated sources and identity barriers are retained.
-		if err := opts.PreparedRestore.DiscardEmpty(); err != nil {
+		if !privateRAM {
+			return -1, errors.New("prepared layered restore requires private RAM")
+		}
+		if err := opts.PreparedRestore.UseLayeredMemory(); err != nil {
 			return -1, err
 		}
-		opts.PreparedRestore = nil
-		logf("prepared restore holder released: using ordinary on-demand restore")
 	}
 	if privateRAM && !templateMemory {
 		closePager, err := startPrivatePager(ctx, stateDir, source, capBytes)
@@ -675,40 +768,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	defer prefetch.Stop()
 
 	markRestore("memory_source")
-	cacheSize, maxDirtySize, err := snapCfg.Resources.DiffCOW.Bytes()
-	if err != nil {
-		return -1, err
+	<-diskDone
+	if diskErr != nil {
+		return -1, diskErr
 	}
-	idleAfter, err := snapCfg.Resources.DiffCOW.CacheIdleDuration()
-	if err != nil {
-		return -1, err
-	}
-	cowCache, stopCache, err := resctl.NewCacheWithBudget(ctx, hooks, cacheSize, maxDirtySize, idleAfter)
-	if err != nil {
-		return -1, err
-	}
-	defer func() {
-		retErr = errors.Join(retErr, cowCache.Close())
-		if retErr != nil {
-			code = -1
-		}
-	}()
-	defer stopCache()
-	markRestore("disk_cache")
-	disks, cleanupDisks, reusedBackends, err := opts.PreparedSources.takeSlotBackends(ctx, cowCache)
-	if err == nil && !reusedBackends {
-		disks, cleanupDisks, err = reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache)
-	}
-	if err != nil {
-		return -1, err
-	}
-	defer func() {
-		retErr = errors.Join(retErr, cleanupDisks())
-		if retErr != nil {
-			code = -1
-		}
-	}()
-	markRestore("disk_reconstruct")
+	markRestore("disk_reconstruct_join")
 
 	waitRetention := func() error { return nil }
 	if opts.CurrentRun != nil {
@@ -752,17 +816,16 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			logf("current disk graph persistence completed duration=%s error=%v", time.Since(started), e)
 			return e
 		}
-		if opts.PreparedRestore != nil {
-			waitRetention = beginPersistence(retain)
-			defer func() {
-				retErr = errors.Join(retErr, waitRetention())
-				if retErr != nil {
-					code = -1
-				}
-			}()
-		} else if err := retain(); err != nil {
-			return -1, err
-		}
+		// Cold resume has the same paused PostSpawn barrier as a prepared
+		// restore. Join publication before Resume in both cases, and before
+		// releasing disk/source ownership on any earlier failure.
+		waitRetention = beginPersistence(retain)
+		defer func() {
+			retErr = errors.Join(retErr, waitRetention())
+			if retErr != nil {
+				code = -1
+			}
+		}()
 	}
 
 	// Network: when the snapshot has a virtio-net device, re-acquire its host
@@ -896,6 +959,15 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	snapshotRoot.ConfigJSON, snapshotRoot.StateJSON = nil, nil
 	markRestore("network_rewrite_gate")
 	flushRestore() // keep instrumentation inside the measured readiness path
+	var startupAck, startupWriter *os.File
+	if privateRAM && opts.PreparedRestore == nil {
+		startupAck, startupWriter, err = os.Pipe()
+		if err != nil {
+			return -1, err
+		}
+		defer startupAck.Close()
+		defer startupWriter.Close()
+	}
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		PrivateRAMFork: privateRAM,
 		BaseDir:        sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
@@ -954,7 +1026,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				return nil
 			}
 			return func(ctx context.Context) (*exec.Cmd, error) {
-				if !privateRAM || !templateMemory {
+				if !privateRAM {
 					return nil, errors.New("prepared restore requires private CoW template memory")
 				}
 				return opts.PreparedRestore.Restore(ctx, runDir, stateDir)
@@ -993,6 +1065,14 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 				restoreArg += fmt.Sprintf(",net_fds=[%s@[%d]]", restoredNetID, e.TapFDNum)
 			}
 			cmd.Args = append(cmd.Args, "--api-socket", e.CHSock, "--restore", restoreArg)
+			if startupWriter != nil {
+				fd := 4 // memfd occupies fd 3
+				if e.TapFDNum > 0 {
+					fd = e.TapFDNum + 1
+				}
+				cmd.ExtraFiles = append(cmd.ExtraFiles, startupWriter)
+				cmd.Args = append(cmd.Args, "--restore-ready-fd", fmt.Sprint(fd))
+			}
 			logf("spawning %s --api-socket %s --restore %s", opts.CHBinary, e.CHSock, restoreArg)
 			return cmd, cleanup, nil
 		},
@@ -1009,6 +1089,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			if opts.PreparedRestore != nil {
 				if !opts.PreparedRestore.RestoreAcknowledged(runDir) {
 					return errors.New("prepared restore has no synchronous paused acknowledgement")
+				}
+			} else if startupAck != nil {
+				// The parent must release its writer so a failed VMM yields EOF.
+				startupWriter.Close()
+				if err := chapi.WaitStartupAck(pc.Ctx, startupAck, opts.HostCfg.APIReadyDeadline()); err != nil {
+					return fmt.Errorf("CH restore acknowledgement: %w", err)
 				}
 			} else if err := chapi.WaitReady(pc.Ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
@@ -1207,6 +1293,13 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
 func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache, pure ...bool) (sandbox.DiskBackend, func() error, error) {
+	startedDisk := time.Now()
+	lastDisk := startedDisk
+	markDisk := func(phase string) {
+		now := time.Now()
+		logf("disk restore timing disk=%s phase=%s duration_ns=%d total_ns=%d end_ns=%d tid=%d", diskKey, phase, now.Sub(lastDisk).Nanoseconds(), now.Sub(startedDisk).Nanoseconds(), now.UnixNano(), unix.Gettid())
+		lastDisk = now
+	}
 	var db sandbox.DiskBackend
 	var closers []func() error
 	cleanup := func() error {
@@ -1271,6 +1364,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		return fail(errors.New("restore disk has no captured base"))
 	}
 
+	markDisk("immutable_layers")
 	// Fresh writable diff. Empty URI → auto-default (ours to remove).
 	if diffURI == "" {
 		baseDir := sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID)
@@ -1292,6 +1386,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
+	markDisk("diff_prepare")
 	cowOptions := []diffstore.DiskOption{diffstore.WithCache(cowCache)}
 	if opts.checkpointPlan != nil {
 		found := false
@@ -1317,6 +1412,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if err != nil {
 		return fail(fmt.Errorf("%s: open BlockCOW: %w", diskKey, err))
 	}
+	markDisk("cow_open")
 	closers = append(closers, cow.Close)
 	db.Cow, db.DiffPath = cow, diffPath
 
@@ -1328,6 +1424,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		}
 		db.Reader, db.BasePath = immutableReader, erofsBaseURI
 	}
+	markDisk("image_join")
 	return db, cleanup, nil
 }
 
@@ -1398,6 +1495,9 @@ func openEROFSBlockReader(ctx context.Context, raw string, opts Options) (diffst
 // .sandbox is narrowed to Payload by sandbox.OpenDiskStreamAtWithOpener; its
 // runtime config is never adopted recursively.
 func openDiskRefStream(ctx context.Context, raw string, opts Options) (fetch.Stream, error) {
+	if opts.validatedDiskLayers != nil {
+		return opts.validatedDiskLayers.Open(raw)
+	}
 	if stream := borrowSandboxPayload(raw, opts); stream != nil {
 		return stream, nil
 	}
@@ -1466,7 +1566,24 @@ func openMemorySnapshotRef(ctx context.Context, raw string, opts Options) (fetch
 	return root.Memory, nil
 }
 
-func openMemoryParentLayers(ctx context.Context, refs []string, opts Options, capacity uint64) (_ []fetch.Stream, retErr error) {
+func openMemoryParentLayers(ctx context.Context, refs []string, opts Options, capacity uint64) ([]fetch.Stream, error) {
+	return openMemoryParentLayersCached(ctx, refs, opts, capacity, false)
+}
+
+func openMemoryParentLayersCached(ctx context.Context, refs []string, opts Options, capacity uint64, private bool) (_ []fetch.Stream, retErr error) {
+	// The cache is a previously authenticated immutable memory-only view of S,
+	// scoped to its exact content identity, customer key and capacity. Borrow
+	// that capability directly when present, rather than parsing a second copy
+	// of the packed carrier only to replace it with this same view later.
+	var fingerprint string
+	if private && opts.CustomerKeyFn != nil && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE") == "1" {
+		key, err := opts.CustomerKeyFn()
+		if err != nil {
+			return nil, err
+		}
+		fingerprint = fmt.Sprintf("%x", sha256.Sum256(key[:]))
+		clear(key[:])
+	}
 	layers := make([]fetch.Stream, 0, len(refs))
 	defer func() {
 		if retErr == nil {
@@ -1477,7 +1594,18 @@ func openMemoryParentLayers(ctx context.Context, refs []string, opts Options, ca
 		}
 	}()
 	for i, ref := range refs {
-		stream, err := openMemorySnapshotRef(ctx, ref, opts)
+		var stream fetch.Stream
+		var err error
+		identity, parseErr := manifest.ParseRef(ref)
+		if fingerprint != "" && parseErr == nil && (identity.Scheme == manifest.RefSchemeManifest || identity.Digest != "") {
+			stream, err = cachedComparisonMemory(ctx, opts.RuntimeRoot, os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR"), fmt.Sprintf("%s:%s:%d", ref, fingerprint, capacity), capacity)
+			if err != nil {
+				return nil, fmt.Errorf("from_refs[%d] immutable memory cache: %w", i, err)
+			}
+		}
+		if stream == nil {
+			stream, err = openMemorySnapshotRef(ctx, ref, opts)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("from_refs[%d]: %w", i, err)
 		}

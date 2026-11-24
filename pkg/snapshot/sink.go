@@ -182,6 +182,9 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 	var options []tarstream.WriteOption
 	if kind == "snapshot" {
 		options = append(options, tarstream.WithIndexMemoryLimit(memoryIndexBudget), tarstream.WithSparseIdentity())
+		if s.codec == nil {
+			options = append(options, tarstream.WithPageAlignedPayload())
+		}
 	}
 	if s.codec != nil {
 		options = append(options, tarstream.WithCodec(s.codec, s.required))

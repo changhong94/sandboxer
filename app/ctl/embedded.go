@@ -97,7 +97,7 @@ func RunShared(ctx context.Context, args, env []string, cgroup, ready *os.File) 
 	defer cgroup.Close()
 	defer ready.Close()
 	argv := append(append([]string(nil), args...), fmt.Sprintf("--cgroup-path=fd=%d", cgroup.Fd()), fmt.Sprintf("--ready-fd=%d", ready.Fd()))
-	if code := runCmdPreparedSourceContext(scoped, ready, argv, nil, nil, nil, cgroup); code != 0 {
+	if code := runCmdPreparedSourceContext(scoped, ready, argv, nil, nil, restore.PreparedSourcesFromContext(ctx), cgroup); code != 0 {
 		return PreparedExitError(code)
 	}
 	return nil

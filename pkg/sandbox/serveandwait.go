@@ -258,6 +258,18 @@ type SnapDiskRef struct {
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
 func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	backendStarted := time.Now()
+	backendLast := backendStarted
+	type backendPhase struct {
+		name       string
+		start, end time.Time
+	}
+	var backendPhases []backendPhase
+	markBackend := func(name string) {
+		now := time.Now()
+		backendPhases = append(backendPhases, backendPhase{name, backendLast, now})
+		backendLast = now
+	}
+
 	if p.owner == nil {
 		p.owner, _ = p.Ctx.Value(runtimeOwnerKey{}).(*Runtime)
 	}
@@ -388,6 +400,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return nil
 	}
 
+	markBackend("initial")
 	// Memory setup. sandbox-ctl owns the memfd; CH inherits it via
 	// cmd.ExtraFiles[0]=memfd. The uffd is created in CH's process and
 	// handed back via SCM_RIGHTS in the va_report message.
@@ -408,6 +421,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return -1, fmt.Errorf("addrmap register backend: %w", err)
 	}
 
+	markBackend("memory")
 	// uffdHandler is constructed inside the va_report OnReady callback
 	// once we have CH's uffd fd. Held here so the deferred Close can
 	// reach it after ctx cancellation.
@@ -660,6 +674,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return -1, err
 	}
 
+	markBackend("devices_and_launch")
 	// guestlink.Pinger drives the host→guest health probe. Started by PostSpawn
 	// (cold: after launch handshake; restore: after restore_ack). 0 ping
 	// timeout → no forced timeout (resolved to config.NoForcedTimeout, since the
@@ -710,6 +725,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		}()
 	}
 
+	markBackend("usage")
 	// Port-forward listeners. Built here so the snapshot handler can pause
 	// + collapse active relays around quiesce (symmetric with the pinger);
 	// started below alongside the other backend servers.
@@ -1077,10 +1093,12 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		// No cleanup may race launch resource construction or publication.
 	}
 
+	markBackend("control_construct")
 	if err := ctlSrv.Listen(); err != nil {
 		stopServers()
 		return -1, fmt.Errorf("ctl.sock listen: %w", err)
 	}
+	markBackend("control_listen")
 	if enabled && (p.owner == nil || p.EnableCheckpoint) {
 		if err := snapHandler.startCheckpointMaintenance(backendCtx, p.CheckpointOwner); err != nil {
 			ctlSrv.Stop()
@@ -1092,6 +1110,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		}
 	}
 
+	markBackend("checkpoint_publish")
 	defer ctlSrv.Stop()
 	// Listen has completed and cleanup is registered. A connection made now
 	// can wait in the kernel accept queue until ctlSrv.Serve starts below.
@@ -1155,6 +1174,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	for i, d := range devs {
 		diskArgs[i] = DiskArg{Sock: d.sock, ReadOnly: d.readonly}
 	}
+	markBackend("workers_and_forward")
 	cmd, chStdioCleanup, err := p.BuildCmd(CmdEnv{
 		Memfd:     memfd,
 		CHSock:    chSock,
@@ -1175,10 +1195,13 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	// CH out of sandbox-ctl's controlling-terminal foreground group, so
 	// terminal-generated ^C/^\/^Z don't hit CH directly — sandbox-ctl
 	// owns signal handling (below).
+	callerFiles := cmd.ExtraFiles
 	cmd.ExtraFiles = []*os.File{memfd.File()}
 	if p.TapFile != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, p.TapFile) // CH fd 4
 	}
+	// Caller descriptors follow the fixed memfd and optional TAP slots.
+	cmd.ExtraFiles = append(cmd.ExtraFiles, callerFiles...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := p.Cgroup.ConfigureSysProcAttr(cmd.SysProcAttr); err != nil {
 		cancelBackends()
@@ -1221,7 +1244,12 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			p.Logf("[prepared backends] run=%s start_ns=%d end_ns=%d", p.SandboxID, backendStarted.UnixNano(), time.Now().UnixNano())
 			cmd, err = p.StartPreparedCH(backendCtx)
 		} else {
+			markBackend("command_setup")
 			err = startCH(cmd, p.NetnsFile)
+			markBackend("exec")
+			for _, phase := range backendPhases {
+				p.Logf("CH_BACKEND phase=%s start_ns=%d end_ns=%d duration_ns=%d", phase.name, phase.start.UnixNano(), phase.end.UnixNano(), phase.end.Sub(phase.start).Nanoseconds())
+			}
 		}
 		if err != nil {
 			cancelBackends()
@@ -1387,8 +1415,12 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 // host netns. cmd.Process is populated by the time this returns.
 func startCH(cmd *exec.Cmd, netnsFile *os.File) error {
 	if netnsFile == nil {
-		return cmd.Start()
+		started := time.Now()
+		err := cmd.Start()
+		fmt.Fprintf(os.Stderr, "CH_SPAWN_HOST start_ns=%d end_ns=%d duration_ns=%d success=%t\n", started.UnixNano(), time.Now().UnixNano(), time.Since(started).Nanoseconds(), err == nil)
+		return err
 	}
+	queued := time.Now()
 	errCh := make(chan error, 1)
 	go func() {
 		// setns(CLONE_NEWNET) changes only the calling thread's netns, so lock
@@ -1398,12 +1430,20 @@ func startCH(cmd *exec.Cmd, netnsFile *os.File) error {
 		// runtime retire it when the goroutine returns rather than reuse it for
 		// host-netns work.
 		runtime.LockOSThread()
+		started := time.Now()
+		var before, after unix.Rusage
+		_ = unix.Getrusage(unix.RUSAGE_THREAD, &before)
 		if err := unix.Setns(int(netnsFile.Fd()), unix.CLONE_NEWNET); err != nil {
 			errCh <- fmt.Errorf("setns(CLONE_NEWNET): %w", err)
 			return
 		}
+		namespaced := time.Now()
 		// fork/exec inherits this thread's netns → CH lands in the tap's netns.
-		errCh <- cmd.Start()
+		err := cmd.Start()
+		finished := time.Now()
+		_ = unix.Getrusage(unix.RUSAGE_THREAD, &after)
+		fmt.Fprintf(os.Stderr, "CH_SPAWN queue_ns=%d setns_ns=%d exec_ns=%d user_us=%d system_us=%d voluntary=%d involuntary=%d tid=%d success=%t\n", started.Sub(queued).Nanoseconds(), namespaced.Sub(started).Nanoseconds(), finished.Sub(namespaced).Nanoseconds(), after.Utime.Nano()/1000-before.Utime.Nano()/1000, after.Stime.Nano()/1000-before.Stime.Nano()/1000, after.Nvcsw-before.Nvcsw, after.Nivcsw-before.Nivcsw, unix.Gettid(), err == nil)
+		errCh <- err
 	}()
 	return <-errCh
 }

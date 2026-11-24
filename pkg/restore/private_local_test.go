@@ -46,6 +46,9 @@ func TestPrivateLocalPinnedFDAndSparseLayout(t *testing.T) {
 	if err != nil || plan == nil {
 		t.Fatalf("plan: %v %v", plan, err)
 	}
+	if len(plan.zeros) != 1 || plan.zeros[0] != ([2]uint64{4096, 4096}) {
+		t.Fatalf("zero plan: %v", plan.zeros)
+	}
 	stop, err := startPrivatePager(context.Background(), root, source, 8192)
 	if err != nil {
 		t.Fatal(err)

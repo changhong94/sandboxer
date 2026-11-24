@@ -20,23 +20,24 @@ import (
 // Close joins all reads before releasing their storage; the launcher owns it
 // until Run has finished, including on cancellation or a rejected final config.
 type PreparedSources struct {
-	slotPlan   *slotRestorePlan
-	stageFiles map[string]StageFileVersion
-	image      *preparedImage
-	network    *forkNetworkRewrite
-	networkMAC string
-	opts       Options
-	key        [32]byte
-	storage    *artifact.ProcessStorage
-	cancel     context.CancelFunc
-	done       chan struct{}
-	root       *openedRootSnapshot
-	snapshot   *snapshotfile.Root
-	memory     *snapshot.Config
-	sandbox    *openedSandboxSource
-	err        error
-	taken      bool
-	closed     bool
+	stageReceipt *slotReceipt
+	slotPlan     *slotRestorePlan
+	stageFiles   map[string]StageFileVersion
+	image        *preparedImage
+	network      *forkNetworkRewrite
+	networkMAC   string
+	opts         Options
+	key          [32]byte
+	storage      *artifact.ProcessStorage
+	cancel       context.CancelFunc
+	done         chan struct{}
+	root         *openedRootSnapshot
+	snapshot     *snapshotfile.Root
+	memory       *snapshot.Config
+	sandbox      *openedSandboxSource
+	err          error
+	taken        bool
+	closed       bool
 }
 
 func PrepareSources(ctx context.Context, opts Options, networkMAC ...string) (*PreparedSources, error) {
@@ -99,6 +100,7 @@ func (p *PreparedSources) Close() {
 	}
 	p.cancel()
 	<-p.done
+	_ = p.WaitSlotDurable()
 	p.image.close()
 	if p.network != nil {
 		p.network.Wait()
@@ -151,6 +153,9 @@ func (p *PreparedSources) take(opts Options) (bool, error) {
 	<-p.done
 	if p.err != nil {
 		return true, p.err
+	}
+	if err := p.WaitSlotDurable(); err != nil {
+		return true, err
 	}
 	p.root.opts = opts.withBundleFetcher(p.root.opts.Fetcher)
 	p.sandbox.opts = opts.withBundleFetcher(p.sandbox.opts.Fetcher)

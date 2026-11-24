@@ -86,6 +86,10 @@ func validatePrivateMemoryMapping(configJSON, stateJSON []byte, capacity uint64)
 	if err := json.Unmarshal(stateJSON, &tree); err != nil {
 		return err
 	}
+	return validatePrivateMemoryTree(&tree, capacity)
+}
+
+func validatePrivateMemoryTree(tree *chSnapshotTree, capacity uint64) error {
 	mm := tree.Snapshots["memory-manager"]
 	if mm == nil || mm.SnapshotData == nil {
 		return fmt.Errorf("missing private RAM snapshot")

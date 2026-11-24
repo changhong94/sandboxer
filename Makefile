@@ -33,7 +33,10 @@ endif
 # Build settings
 # ---------------------------------------------------------------------------
 GO             := go
-GO_BUILD_FLAGS := -trimpath
+# Release binaries avoid hashing and caching unused debug sections.
+# Set GO_LDFLAGS= for a DWARF-enabled debugging build.
+GO_LDFLAGS     ?= -s -w
+GO_BUILD_FLAGS := -trimpath -ldflags="$(GO_LDFLAGS)"
 BINDIR         := bin/$(TARGET_ARCH)
 BUILD_DIR      := build/$(TARGET_ARCH)
 E2E_FIXTURE_DIR ?= $(abspath build/e2e-tools/$(TARGET_ARCH))

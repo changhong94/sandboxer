@@ -56,35 +56,91 @@ func prepareSlotCatalogsFile(ctx context.Context, f *os.File, spec sandbox.Runti
 	return prepareSlotCatalogValues(ctx, descriptors, spec, runtime)
 }
 
+type slotCatalogSource struct {
+	source *restore.PreparedSources
+	close  func()
+	err    error
+}
+
+// Start only authenticated immutable reads. No runtime directory, writable disk,
+// TAP or guest state is installed until KVM preparation and normal StageForSlot.
+func prepareFirstSlotSource(ctx context.Context, d restore.StagedCatalog, mac string) slotCatalogSource {
+	raw, err := hex.DecodeString(d.Key)
+	if err != nil || len(raw) != 32 {
+		clear(raw)
+		return slotCatalogSource{err: errors.New("invalid stage key")}
+	}
+	var key [32]byte
+	copy(key[:], raw)
+	clear(raw)
+	source, closeSource, err := prepareAssignedSourcesUsing(ctx, preparedSourceRequest{Ref: d.Ref, SandboxHint: d.SandboxHint, Locations: d.Locations, ManifestConfig: d.ManifestConfig}, nil, func() ([32]byte, error) { return key, nil }, mac)
+	clear(key[:])
+	return slotCatalogSource{source, closeSource, err}
+}
+
 func prepareSlotCatalogValues(ctx context.Context, descriptors []restore.StagedCatalog, spec sandbox.RuntimeSpec, runtime *sandbox.PreparedRestore) ([]slotCatalogEntry, error) {
+	return prepareSlotCatalogValuesWithFirst(ctx, descriptors, spec, runtime, nil)
+}
+
+func prepareSlotCatalogValuesWithFirst(ctx context.Context, descriptors []restore.StagedCatalog, spec sandbox.RuntimeSpec, runtime *sandbox.PreparedRestore, first *slotCatalogSource) ([]slotCatalogEntry, error) {
 	if runtime == nil || len(descriptors) > 64 {
 		return nil, errors.New("invalid private staged catalogs")
 	}
 	// The caller transferred these descriptors; plans retain only what they need.
 	defer clear(descriptors)
-	var entries []slotCatalogEntry
-	started := time.Now()
+	// Decode all credentials before opening any source. Each asynchronous reader
+	// captures its own key synchronously; never expose it to a slot or guest.
+	keys := make([][32]byte, len(descriptors))
+	defer clear(keys)
 	for i := range descriptors {
-		d := &descriptors[i]
-		raw, err := hex.DecodeString(d.Key)
-		d.Key = ""
+		raw, err := hex.DecodeString(descriptors[i].Key)
+		descriptors[i].Key = ""
 		if err != nil || len(raw) != 32 {
-			for _, e := range entries {
-				e.close()
-			}
+			clear(raw)
 			return nil, errors.New("invalid stage key")
 		}
-		var key [32]byte
-		copy(key[:], raw)
+		copy(keys[i][:], raw)
 		clear(raw)
-		source, closeSource, err := prepareAssignedSourcesUsing(ctx, preparedSourceRequest{Ref: d.Ref, SandboxHint: d.SandboxHint, Locations: d.Locations, ManifestConfig: d.ManifestConfig}, nil, func() ([32]byte, error) { return key, nil }, runtime.PreparedNetworkMAC())
-		clear(key[:])
+	}
+	var entries []slotCatalogEntry
+	started := time.Now()
+	prepare := func(i int) slotCatalogSource {
+		d := &descriptors[i]
+		source, closeSource, err := prepareAssignedSourcesUsing(ctx, preparedSourceRequest{Ref: d.Ref, SandboxHint: d.SandboxHint, Locations: d.Locations, ManifestConfig: d.ManifestConfig}, nil, func() ([32]byte, error) { return keys[i], nil }, runtime.PreparedNetworkMAC())
+		clear(keys[i][:])
+		return slotCatalogSource{source, closeSource, err}
+	}
+	var pending slotCatalogSource
+	if len(descriptors) != 0 {
+		if first != nil {
+			pending = *first
+			*first = slotCatalogSource{} // transfer close responsibility exactly once
+		} else {
+			pending = prepare(0)
+		}
+	}
+	defer func() {
+		if pending.close != nil {
+			pending.close()
+		}
+	}()
+	for i := range descriptors {
+		d := &descriptors[i]
+		current := pending
+		pending = slotCatalogSource{}
+		// One-source lookahead overlaps authenticated immutable reads with the
+		// current slot's durable disk work. Disk ownership, publication and
+		// Ready remain serial and fenced; there is no per-image VM pool.
+		if i+1 < len(descriptors) {
+			pending = prepare(i + 1)
+		}
+		source, closeSource, err := current.source, current.close, current.err
 		if err == nil && source != nil {
 			tap, tapErr := runtime.PreparedNetworkTAP()
 			if tapErr != nil {
 				err = tapErr
 			} else {
-				err = source.StageForSlot(ctx, spec, d.Files, tap)
+				err = source.StageForSlotAsyncReceipt(ctx, spec, d.Files, tap)
 			}
 		}
 		if err != nil || source == nil {
@@ -97,6 +153,17 @@ func prepareSlotCatalogValues(ctx context.Context, descriptors []restore.StagedC
 		once := sync.OnceFunc(closeSource)
 		memtrace.Mark("catalog_staged")
 		entries = append(entries, slotCatalogEntry{source: source, close: once})
+	}
+	// Do not advertise the generic slot until every retained catalog is durable.
+	// Close joins the same operation on failure; no writer/receipt can be recycled
+	// while its fsync is still in flight.
+	for _, entry := range entries {
+		if err := entry.source.WaitSlotDurable(); err != nil {
+			for _, owned := range entries {
+				owned.close()
+			}
+			return nil, err
+		}
 	}
 	log.Printf("slot catalogs ready count=%d requested=%d duration=%s", len(entries), len(descriptors), time.Since(started))
 	return entries, nil

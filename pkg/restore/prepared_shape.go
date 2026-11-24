@@ -34,11 +34,17 @@ func validatePreparedShape(configJSON, stateJSON []byte, cpu int, declaredCap, a
 	if requirePrivate && !privateRAM {
 		return preparedShape{}, fmt.Errorf("private RAM restore requires private snapshot topology")
 	}
-	validateMapping := validateMemoryMapping
-	if privateRAM {
-		validateMapping = validatePrivateMemoryMapping
+	// Decode the potentially large CPU/device state once. Both consumers retain
+	// their complete validation; the decoded tree is owned by this request.
+	var tree chSnapshotTree
+	if err := json.Unmarshal(stateJSON, &tree); err != nil {
+		return preparedShape{}, fmt.Errorf("state.json: %w", err)
 	}
-	if err := validateMapping(configJSON, stateJSON, snapCap); err != nil {
+	if privateRAM {
+		if err := validatePrivateMemoryTree(&tree, snapCap); err != nil {
+			return preparedShape{}, err
+		}
+	} else if err := validateMemoryMapping(configJSON, stateJSON, snapCap); err != nil {
 		return preparedShape{}, err
 	}
 	if declaredCap != snapCap {
@@ -50,7 +56,7 @@ func validatePreparedShape(configJSON, stateJSON []byte, cpu int, declaredCap, a
 	if snapCap > uint64(^uint(0)>>1) {
 		return preparedShape{}, fmt.Errorf("restore Capacity %d exceeds host addressable memory size", snapCap)
 	}
-	balTarget, balCurrent, balOk, err := parseBalloonFromState(stateJSON)
+	balTarget, balCurrent, balOk, err := parseBalloonFromTree(&tree)
 	if err != nil {
 		return preparedShape{}, fmt.Errorf("parse balloon from state.json: %w", err)
 	}

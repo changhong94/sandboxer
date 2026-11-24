@@ -17,6 +17,7 @@ func (c *Disk) AdoptPreparedCache(ctx context.Context, next *Cache) error {
 		return err
 	}
 	c.opMu.Lock()
+	c.frontendUsed.Store(true)
 	defer c.opMu.Unlock()
 	if err := c.lifeCtx.Err(); err != nil {
 		return err

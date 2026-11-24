@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -95,6 +97,8 @@ func (c *SnapshotCfg) ArtifactRefs() []string {
 
 // SnapshotCfgReadOptions supplies trusted local ref resolution inputs.
 type SnapshotCfgReadOptions struct {
+	RetainSources bool // consumes this reader; caller owns Sources through run exit
+
 	// PrepareSandboxRef resolves trusted named locations after S has been
 	// authenticated, before opening its selected E. It must not skip E verification.
 	PrepareSandboxRef func(string) error
@@ -105,6 +109,12 @@ type SnapshotCfgReadOptions struct {
 // SnapshotCfgDocument carries the derived compatibility projection and the
 // original canonical new-schema snapshot.cfg bytes.
 type SnapshotCfgDocument struct {
+	Sources *PreparedSources `json:"-"`
+
+	// Owned metadata from the exact authenticated E selected while S was open.
+	// Callers can reuse it rather than reopening the same source by name.
+	SandboxConfig *config.PortableSandboxConfig
+	ImageConfig   []byte
 	// SandboxRef retains the actual E selection made by this read, including
 	// current/sibling Bundle selectors or a remote Manifest fallback.
 	SandboxRef string
@@ -148,6 +158,7 @@ func (r *SnapshotCfgReader) Close() error {
 // and derives a compatibility view from Sandbox E. It never accepts the old
 // disk-bearing snapshot.cfg schema.
 func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts SnapshotCfgReadOptions) (*SnapshotCfgDocument, error) {
+	started := time.Now()
 	opened, root, memoryCfg, err := r.openSnapshot(ctx, rootRef, opts)
 	if err != nil {
 		return nil, err
@@ -157,17 +168,41 @@ func (r *SnapshotCfgReader) Read(ctx context.Context, rootRef string, opts Snaps
 			return nil, errors.Join(fmt.Errorf("snapshot.cfg sandbox_ref location: %w", err), root.Close())
 		}
 	}
+	snapshotDone := time.Now()
 	sandboxSource, err := openReferencedSandbox(ctx, memoryCfg.SandboxRef, opened.opts)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("snapshot.cfg sandbox_ref: %w", err), root.Close())
 	}
 
+	sandboxDone := time.Now()
 	projection, projectErr := projectSnapshotCfg(memoryCfg, sandboxSource.Root.Portable)
-	document := &SnapshotCfgDocument{SandboxRef: sandboxSource.SelectedRef, Config: projection, Raw: append([]byte(nil), root.SnapshotConfig...)}
-	closeErr := errors.Join(sandboxSource.Root.Close(), root.Close())
-	if projectErr != nil || closeErr != nil {
-		return nil, errors.Join(projectErr, closeErr)
+	portable, cloneErr := sandboxSource.Root.Portable.Clone()
+	document := &SnapshotCfgDocument{SandboxConfig: portable, ImageConfig: append([]byte(nil), sandboxSource.Root.ImageConfig...), SandboxRef: sandboxSource.SelectedRef, Config: projection, Raw: append([]byte(nil), root.SnapshotConfig...)}
+	if projectErr != nil || cloneErr != nil {
+		return nil, errors.Join(projectErr, cloneErr, sandboxSource.Root.Close(), root.Close())
 	}
+	if opts.RetainSources {
+		storage := r.storage
+		key, err := storage.CustomerKeyFunc()()
+		if err != nil {
+			return nil, errors.Join(err, storage.Close(), sandboxSource.Root.Close(), root.Close())
+		}
+		r.storage = nil // transfer the original fetcher owner, not a borrowed view
+		p := &PreparedSources{opts: opened.opts, key: key, storage: storage, cancel: func() {}, done: make(chan struct{}), root: opened, snapshot: root, memory: memoryCfg, sandbox: sandboxSource}
+		clear(key[:])
+		p.opts.storage = storage
+		p.opts.CustomerKeyFn = func() ([32]byte, error) { return p.key, nil }
+		// Match the same absolute unlocated ref passed to the eventual runtime.
+		if ref, e := manifest.ParseRef(p.opts.SnapshotRef); e == nil && ref.Scheme == manifest.RefSchemeFile && ref.Location == "" && !filepath.IsAbs(ref.Path) {
+			ref.Path = p.opts.SnapshotPath
+			p.opts.SnapshotRef = ref.String()
+		}
+		close(p.done)
+		document.Sources = p
+	} else if err := errors.Join(sandboxSource.Root.Close(), root.Close()); err != nil {
+		return nil, err
+	}
+	log.Printf("SNAPSHOT_SOURCE snapshot_ns=%d sandbox_ns=%d projection_ns=%d total_ns=%d", snapshotDone.Sub(started).Nanoseconds(), sandboxDone.Sub(snapshotDone).Nanoseconds(), time.Since(sandboxDone).Nanoseconds(), time.Since(started).Nanoseconds())
 	return document, nil
 }
 

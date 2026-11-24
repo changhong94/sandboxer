@@ -13,6 +13,7 @@ import (
 )
 
 type privateLocalPlan struct {
+	zeros   [][2]uint64 // immutable zero/hole view, collected with the data plan
 	files   []*os.File  // borrowed from the immutable source, held until CH exits
 	extents [][4]uint64 // RAM offset, length, physical file offset
 }
@@ -54,7 +55,14 @@ func planPrivateLocal(source uffd.SnapshotReader, size uint64) (*privateLocalPla
 				return nil, nil
 			}
 			p.extents = append(p.extents, [4]uint64{off, r.End() - off, physical, uint64(index)})
-		} else if r.Kind() != sparse.Hole && r.Kind() != sparse.Zero {
+		} else if r.Kind() == sparse.Hole || r.Kind() == sparse.Zero {
+			n := len(p.zeros)
+			if n > 0 && p.zeros[n-1][0]+p.zeros[n-1][1] == off {
+				p.zeros[n-1][1] += r.End() - off
+			} else {
+				p.zeros = append(p.zeros, [2]uint64{off, r.End() - off})
+			}
+		} else {
 			return nil, fmt.Errorf("invalid local RAM run kind")
 		}
 		off = r.End()

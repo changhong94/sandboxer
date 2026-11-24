@@ -122,6 +122,19 @@ func prepareRunContext(parent context.Context, args []string, files *PreparedFil
 	defer cancel()
 	stop := context.AfterFunc(ctx, func() { _ = input.Close() })
 	defer stop()
+	// The first immutable catalog read used to begin only after KVM was ready.
+	// Like independent old-fork preparation work, overlap it with KVM creation;
+	// neither side can advertise Ready without the normal final durable staging.
+	var firstSource *slotCatalogSource
+	if spec.RestoreOnly && files != nil && len(files.Catalogs) > 0 {
+		source := prepareFirstSlotSource(ctx, files.Catalogs[0], spec.Network.MAC)
+		firstSource = &source
+		defer func() {
+			if firstSource.close != nil {
+				firstSource.close()
+			}
+		}()
+	}
 	var vm *sandbox.Runtime
 	var restored *sandbox.PreparedRestore
 	if spec.RestoreOnly {
@@ -141,7 +154,7 @@ func prepareRunContext(parent context.Context, args []string, files *PreparedFil
 	memtrace.Mark("kvm_prepared")
 	var entries []slotCatalogEntry
 	if files != nil && files.Catalogs != nil {
-		entries, err = prepareSlotCatalogValues(ctx, files.Catalogs, spec, restored)
+		entries, err = prepareSlotCatalogValuesWithFirst(ctx, files.Catalogs, spec, restored, firstSource)
 		files.Catalogs = nil
 	} else if files != nil {
 		entries, err = prepareSlotCatalogsFile(ctx, files.Stages, spec, restored)
@@ -254,6 +267,24 @@ func finishPreparedLaunch(ctx context.Context, runReady *os.File, decoder *json.
 		return 2
 	}
 
+	if handoff := restore.SourceHandoff(ctx); handoff != nil {
+		if !instanceenv.Shared(ctx) {
+			fmt.Fprintln(os.Stderr, "source handoff requires shared owner")
+			return 2
+		}
+		select {
+		case assigned := <-handoff:
+			if assigned != nil {
+				if sources != nil {
+					fmt.Fprintln(os.Stderr, "ambiguous source capability")
+					return 2
+				}
+				sources = assigned
+			}
+		case <-ctx.Done():
+			return 1
+		}
+	}
 	if inheritedCgroup != nil {
 		return runCmdPreparedSourceContext(ctx, runReady, launch.Args, vm, restored, sources, inheritedCgroup)
 	}

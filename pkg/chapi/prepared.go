@@ -12,3 +12,8 @@ func (c Client) RestoreCoWContext(ctx context.Context, source string) error {
 	b, _ := json.Marshal(map[string]any{"source_url": source, "memory_restore_mode": "CopyOnWrite", "resume": false})
 	return c.doContext(ctx, "PUT", "/api/v1/vm.restore", string(b))
 }
+
+func (c Client) RestoreOnDemandContext(ctx context.Context, source string) error {
+	b, _ := json.Marshal(map[string]any{"source_url": source, "memory_restore_mode": "OnDemand", "resume": false})
+	return c.doContext(ctx, "PUT", "/api/v1/vm.restore", string(b))
+}
