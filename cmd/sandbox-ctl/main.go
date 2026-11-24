@@ -56,8 +56,6 @@ func main() {
 		os.Exit(checkpointCmd(os.Args[2:]))
 	case "reset":
 		os.Exit(resetCmd(os.Args[2:]))
-	case "fork":
-		os.Exit(forkCmd(os.Args[2:]))
 	case "snapshot":
 		os.Exit(snapshotCmd(os.Args[2:]))
 	case "export":
@@ -124,7 +122,7 @@ Usage:
                         --operation-id <id> [--manifest-config <path>] [--json]
   sandbox-ctl export    [--sandbox-id <sid>] [--path-id <leaf>]
                         (--output <out_dir> | --upload | --checkpoint <ID>)
-                        [--mode local|bundle] [--resume]
+                        [--mode local|bundle] [--resume | --resume-early]
                         [--run-root <dir>] [--timeout <sec>]
   # With --checkpoint, optional --output must be the owner's checkpoint directory.
   sandbox-ctl export    --source-ref <saved-E-or-S> --disk <name> (--output <dir> | --upload)
@@ -140,12 +138,9 @@ Usage:
                         [--mode local|bundle] [--manifest-config <path>]
                         [--ref-location name=file:///absolute/path ...]
                         [--timeout <sec>]
-  sandbox-ctl fork      --sandbox-id <sid> (--output <dir> | --upload) [--json]
-                        capture an ordinary snapshot and keep the original running
-
   sandbox-ctl snapshot  [--sandbox-id <sid>] [--path-id <leaf>]
                         (--output <out_dir> | --upload | --checkpoint <ID>)
-                        [--mode local|bundle] [--resume]
+                        [--mode local|bundle] [--resume | --resume-early]
                         [--drop-caches] [--merge-ref=true|false]
                         [--run-root <dir>] [--timeout <sec>]
   sandbox-ctl exec      [--sandbox-id <sid>] [--path-id <leaf>] [--run-root <dir>]
@@ -209,7 +204,9 @@ the current Sandbox E first and Snapshot S last; S points to E. Local output
 defaults to content-addressed tarstreams, mode=bundle writes one Manifest
 Bundle, and --upload writes the same logical graph to the Manifest store.
 By default a successful live export/snapshot destroys the sandbox; --resume
-keeps the original C0, writable diffs, and memory parent running. Recovery
+keeps the original C0, writable diffs, and memory parent running. --resume-early
+resumes after fixing independent inputs, before persistence completes; it
+implies --resume and still returns only after saving completes. Recovery
 reattaches the guest MUX before success is reported; an unrecoverable reattach
 failure terminates the VMM instead of leaving a frozen sandbox behind.
 

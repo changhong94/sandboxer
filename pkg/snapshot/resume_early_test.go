@@ -11,14 +11,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestForkFrozenSourcePreservesStatesAndDetachesWrites(t *testing.T) {
+func TestResumeEarlyFrozenSourcePreservesStatesAndDetachesWrites(t *testing.T) {
 	live := bytes.Repeat([]byte{0x71}, 3*4096)
 	src := &memorySource{size: uint64(len(live))}
 	src.resolve = func(off, limit uint64) (sparse.Run, error) {
 		kind := []sparse.RunKind{sparse.Data, sparse.Zero, sparse.Hole}[off/4096]
 		return memoryRun{off: off, end: min((off/4096+1)*4096, off+limit), kind: kind, read: func(_ context.Context, b []byte, p uint64) (int, error) { return copy(b, live[p:]), nil }}, nil
 	}
-	frozen, err := freezeForkSource(context.Background(), src)
+	frozen, err := freezeResumeEarlySource(context.Background(), src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestForkFrozenSourcePreservesStatesAndDetachesWrites(t *testing.T) {
 	}
 }
 
-func TestForkCanceledCopyReleasesTemporaryFile(t *testing.T) {
+func TestResumeEarlyCanceledCopyReleasesTemporaryFile(t *testing.T) {
 	count := func() int {
 		rows, err := os.ReadDir("/proc/self/fd")
 		if err != nil {
@@ -58,7 +58,7 @@ func TestForkCanceledCopyReleasesTemporaryFile(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	source, _ := sparse.NewSource(bytes.NewReader(make([]byte, 4096)), 4096, nil)
-	if _, err := freezeForkSource(ctx, source); !errors.Is(err, context.Canceled) {
+	if _, err := freezeResumeEarlySource(ctx, source); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if after := count(); after != before {
@@ -66,19 +66,19 @@ func TestForkCanceledCopyReleasesTemporaryFile(t *testing.T) {
 	}
 }
 
-func TestForkShortReadCannotPublishFrozenInput(t *testing.T) {
+func TestResumeEarlyShortReadCannotPublishFrozenInput(t *testing.T) {
 	source, _ := sparse.NewSource(bytes.NewReader([]byte{1}), 4096, nil)
-	if frozen, err := freezeForkSource(context.Background(), source); err == nil || frozen != nil {
+	if frozen, err := freezeResumeEarlySource(context.Background(), source); err == nil || frozen != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestForkKernelCopyKeepsSparseFrozenRAM(t *testing.T) {
-	fd, err := unix.MemfdCreate("fork-input", unix.MFD_CLOEXEC)
+func TestResumeEarlyKernelCopyKeepsSparseFrozenRAM(t *testing.T) {
+	fd, err := unix.MemfdCreate("resume-early-input", unix.MFD_CLOEXEC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	live := os.NewFile(uintptr(fd), "fork-input")
+	live := os.NewFile(uintptr(fd), "resume-early-input")
 	defer live.Close()
 	const size = 4 << 20
 	if err := live.Truncate(size); err != nil {
@@ -89,7 +89,7 @@ func TestForkKernelCopyKeepsSparseFrozenRAM(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := &releasedMemorySource{fd: fd, size: size, holes: []sparse.Extent{{Offset: 2 << 20, Size: 2 << 20}}}
-	frozen, err := freezeForkSourceFD(context.Background(), src, fd)
+	frozen, err := freezeResumeEarlySourceFD(context.Background(), src, fd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,19 +108,19 @@ func TestForkKernelCopyKeepsSparseFrozenRAM(t *testing.T) {
 	if _, err := frozen.file.WriteAt([]byte{1}, 0); !errors.Is(err, unix.EPERM) {
 		t.Fatal("snapshot not sealed", err)
 	}
-	if _, err := freezeForkSourceFD(context.Background(), src, 987654); !errors.Is(err, unix.EBADF) {
+	if _, err := freezeResumeEarlySourceFD(context.Background(), src, 987654); !errors.Is(err, unix.EBADF) {
 		t.Fatal("bad source accepted", err)
 	}
 }
 
-type forkTestPin struct {
+type resumeEarlyTestPin struct {
 	sparse.Source
 	closed bool
 }
 
-func (p *forkTestPin) Close() error { p.closed = true; return nil }
+func (p *resumeEarlyTestPin) Close() error { p.closed = true; return nil }
 
-func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
+func TestResumeEarlyPinnedDiskViewAndFailureCleanup(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(map[bool]string{false: "success", true: "RAM failure"}[fail], func(t *testing.T) {
 			f, err := os.CreateTemp(t.TempDir(), "ram")
@@ -132,7 +132,7 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			source, _ := sparse.NewSource(bytes.NewReader(bytes.Repeat([]byte{0x11}, 4096)), 4096, nil)
-			pin := &forkTestPin{Source: source}
+			pin := &resumeEarlyTestPin{Source: source}
 			created, deleted, opened := "", false, false
 			d := DiskDiff{
 				TemporaryCheckpoint: func(_ context.Context, id string) error { created = id; return nil },
@@ -156,7 +156,7 @@ func TestForkPinnedDiskViewAndFailureCleanup(t *testing.T) {
 			if fail {
 				s.MemfdFD = 987654
 			}
-			release, err := freezeForkInputs(context.Background(), &s)
+			release, err := freezeResumeEarlyInputs(context.Background(), &s)
 			if fail {
 				if err == nil || opened || !deleted {
 					t.Fatal("failure leaked pin/checkpoint", err)

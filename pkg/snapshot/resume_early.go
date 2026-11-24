@@ -17,37 +17,37 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// frozenForkSource is an ephemeral, sealed copy, not a new snapshot format.
+// frozenResumeEarlySource is an ephemeral, sealed copy, not a new snapshot format.
 // Keep the three-state map: an explicit Zero must never become an inherited Hole.
 // RAM Data is still copied while paused: a shared mutable memfd cannot safely
 // become an upstream frozen-memory holder while its VM continues writing.
 // Ordinary sinks own final persistence; the kernel-copy path adds no new format.
-type frozenForkSource struct {
+type frozenResumeEarlySource struct {
 	*memorySource
 	file *os.File
 }
 
-func (s *frozenForkSource) Close() error { return s.file.Close() }
+func (s *frozenResumeEarlySource) Close() error { return s.file.Close() }
 
-type borrowedForkSource struct{ sparse.Source }
+type borrowedResumeEarlySource struct{ sparse.Source }
 
-func (borrowedForkSource) Close() error { return nil }
+func (borrowedResumeEarlySource) Close() error { return nil }
 
-func freezeForkSource(ctx context.Context, input sparse.Source) (*frozenForkSource, error) {
-	return freezeForkSourceFD(ctx, input, -1)
+func freezeResumeEarlySource(ctx context.Context, input sparse.Source) (*frozenResumeEarlySource, error) {
+	return freezeResumeEarlySourceFD(ctx, input, -1)
 }
 
 // sourceFD, when supplied, must back input at identical byte offsets. Only RAM
 // uses this path; encrypted or layered disk sources always use their reader.
-func freezeForkSourceFD(ctx context.Context, input sparse.Source, sourceFD int) (_ *frozenForkSource, err error) {
+func freezeResumeEarlySourceFD(ctx context.Context, input sparse.Source, sourceFD int) (_ *frozenResumeEarlySource, err error) {
 	if input.Size() > uint64(^uint64(0)>>1) {
-		return nil, errors.New("fork: source is too large")
+		return nil, errors.New("resume-early: source is too large")
 	}
-	fd, err := unix.MemfdCreate("kuasar-fork", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	fd, err := unix.MemfdCreate("kuasar-resumeEarly", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
 		return nil, err
 	}
-	f := os.NewFile(uintptr(fd), "kuasar-fork")
+	f := os.NewFile(uintptr(fd), "kuasar-resumeEarly")
 	defer func() {
 		if err != nil {
 			_ = f.Close()
@@ -105,7 +105,7 @@ func freezeForkSourceFD(ctx context.Context, input sparse.Source, sourceFD int) 
 			var scratch []byte
 			fdIn := sourceFD
 			for i := w; i < len(copies); i += workers {
-				if e := copyForkRun(copyCtx, copies[i], f, &fdIn, &scratch); e != nil {
+				if e := copyResumeEarlyRun(copyCtx, copies[i], f, &fdIn, &scratch); e != nil {
 					errs[w] = e
 					cancel()
 					return
@@ -124,7 +124,7 @@ func freezeForkSourceFD(ctx context.Context, input sparse.Source, sourceFD int) 
 	if _, err = unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
 		return nil, err
 	}
-	s := &frozenForkSource{file: f, memorySource: &memorySource{size: input.Size()}}
+	s := &frozenResumeEarlySource{file: f, memorySource: &memorySource{size: input.Size()}}
 	s.resolve = func(off, limit uint64) (sparse.Run, error) {
 		i := sort.Search(len(runs), func(i int) bool { return runs[i].end > off })
 		if i == len(runs) {
@@ -144,8 +144,8 @@ func freezeForkSourceFD(ctx context.Context, input sparse.Source, sourceFD int) 
 	return s, nil
 }
 
-// copyForkRun uses explicit offsets; parallel workers never share a file cursor.
-func copyForkRun(ctx context.Context, run sparse.Run, file *os.File, sourceFD *int, scratch *[]byte) error {
+// copyResumeEarlyRun uses explicit offsets; parallel workers never share a file cursor.
+func copyResumeEarlyRun(ctx context.Context, run sparse.Run, file *os.File, sourceFD *int, scratch *[]byte) error {
 	for pos := run.Offset(); pos < run.End(); {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -196,7 +196,7 @@ func copyForkRun(ctx context.Context, run sparse.Run, file *os.File, sourceFD *i
 // Called only after guest quiesce, CH pause, backend quiesce and CH snapshot.
 // Every live byte source is detached before any writer is resumed. Returned
 // views last until all ordinary sink calls finish, including failure paths.
-func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err error) {
+func freezeResumeEarlyInputs(ctx context.Context, s *Sources) (_ func() error, err error) {
 	started := time.Now()
 	var owned []func() error
 	release := func() error {
@@ -222,12 +222,12 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err erro
 			if _, e := rand.Read(nonce[:]); e != nil {
 				return nil, e
 			}
-			id := "fork-" + hex.EncodeToString(nonce[:])
+			id := "resume-early-" + hex.EncodeToString(nonce[:])
 			// Creation can commit before reporting an I/O error. Register cleanup first;
 			// the durable temporary flag also covers process death and failed cleanup.
 			owned = append(owned, func() error { return d.DeleteCheckpoint(context.Background(), id) })
 			if e := d.TemporaryCheckpoint(ctx, id); e != nil {
-				return nil, fmt.Errorf("fork checkpoint disk %d: %w", i, e)
+				return nil, fmt.Errorf("resume-early checkpoint disk %d: %w", i, e)
 			}
 			// The retained checkpoint already forces CoW. Open its reader only
 			// when the sink runs, after guest resume; the sink owns that reader.
@@ -241,9 +241,9 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err erro
 		active.MergeBase = ""
 		source, closeSource, e := prepareDiskSource(ctx, active, s.LocalCodec, s.LocalRequired, s.MergeBaseOpener)
 		if e != nil {
-			return nil, fmt.Errorf("fork disk %d: %w", i, e)
+			return nil, fmt.Errorf("resume-early disk %d: %w", i, e)
 		}
-		frozen, e := freezeForkSource(ctx, source)
+		frozen, e := freezeResumeEarlySource(ctx, source)
 		closeErr := closeSource()
 		if frozen != nil {
 			owned = append(owned, frozen.Close)
@@ -251,10 +251,10 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err erro
 		if e != nil || closeErr != nil {
 			return nil, errors.Join(e, closeErr)
 		}
-		s.Diffs[i].Export = func(context.Context) (ExportView, error) { return borrowedForkSource{frozen}, nil }
+		s.Diffs[i].Export = func(context.Context) (ExportView, error) { return borrowedResumeEarlySource{frozen}, nil }
 	}
 	if s.Logf != nil {
-		s.Logf("fork freeze: disks_ms=%.3f", float64(time.Since(started))/float64(time.Millisecond))
+		s.Logf("resume-early freeze: disks_ms=%.3f", float64(time.Since(started))/float64(time.Millisecond))
 	}
 	memoryStarted := time.Now()
 	var source sparse.Source
@@ -283,14 +283,14 @@ func freezeForkInputs(ctx context.Context, s *Sources) (_ func() error, err erro
 		source = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
 		s.MemoryLayout = func() ([]sparse.Extent, []sparse.Extent, error) { return holes, zeros, nil }
 	}
-	frozen, e := freezeForkSourceFD(ctx, source, s.MemfdFD)
+	frozen, e := freezeResumeEarlySourceFD(ctx, source, s.MemfdFD)
 	if e != nil {
 		return nil, e
 	}
 	owned = append(owned, frozen.Close)
 	s.MemfdFD = int(frozen.file.Fd())
 	if s.Logf != nil {
-		s.Logf("fork freeze: memory_ms=%.3f", float64(time.Since(memoryStarted))/float64(time.Millisecond))
+		s.Logf("resume-early freeze: memory_ms=%.3f", float64(time.Since(memoryStarted))/float64(time.Millisecond))
 	}
 	return release, nil
 }

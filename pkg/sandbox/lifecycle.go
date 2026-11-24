@@ -1101,9 +1101,9 @@ func (h *SnapshotHandler) handle(req ctl.Request, cgroupPath string, chExited <-
 	return h.handleContext(h.Context, req, cgroupPath, chExited)
 }
 func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cgroupPath string, chExited <-chan struct{}) (resp ctl.Response, err error) {
-	if req.Type == ctl.TypeForkRequest {
-		if req.CheckpointID != "" || req.HostRetirement != nil {
-			return ctl.Response{}, errors.New("fork does not retire the VM or create a named local checkpoint")
+	if req.ResumeEarly {
+		if (req.Type != "" && req.Type != ctl.TypeSnapshotRequest) || req.CheckpointID != "" || req.HostRetirement != nil {
+			return ctl.Response{}, errors.New("resume-early does not retire the VM or create a named local checkpoint")
 		}
 		req.ResumeAfter = true
 	}
@@ -1546,10 +1546,10 @@ func handleSnapshotRequest(
 	memoryController *resctl.MemoryController,
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
-	forkStarted := time.Now()
+	resumeEarlyStarted := time.Now()
 	defer func() {
-		if req.Type == ctl.TypeForkRequest && err == nil {
-			resp.ForkSaveMs = float64(time.Since(forkStarted)) / float64(time.Millisecond)
+		if req.ResumeEarly && err == nil {
+			resp.SaveCompleteMs = float64(time.Since(resumeEarlyStarted)) / float64(time.Millisecond)
 		}
 	}()
 
@@ -1948,8 +1948,8 @@ func handleSnapshotRequest(
 	if pinger != nil && pinger.Client != nil {
 		client = pinger.Client
 	}
-	forkPauseStart := time.Now()
-	var forkPauseMs float64
+	resumeEarlyPauseStart := time.Now()
+	var resumeEarlyPauseMs float64
 	guestRecoveryRequired = true
 	result, qerr := guestlink.SendQuiesceContext(ctx, client, !dropCaches)
 	if qerr != nil {
@@ -2028,15 +2028,15 @@ func handleSnapshotRequest(
 	if save != nil {
 		src.FrozenMemory = save.capture(opts, memoryParents, !mergeRef)
 	}
-	if req.Type == ctl.TypeForkRequest {
-		src.Fork = true
+	if req.ResumeEarly {
+		src.ResumeEarly = true
 		src.ResumeGuest = func() error {
-			if err := failRecovery(reattachRunningGuest("fork")); err != nil {
+			if err := failRecovery(reattachRunningGuest("resume-early")); err != nil {
 				return err
 			}
-			forkPauseMs = float64(time.Since(forkPauseStart)) / float64(time.Millisecond)
+			resumeEarlyPauseMs = float64(time.Since(resumeEarlyPauseStart)) / float64(time.Millisecond)
 			guestQuiesced = false
-			logf("fork: original guest resumed pause_ms=%.3f", forkPauseMs)
+			logf("resume-early: original guest resumed pause_ms=%.3f", resumeEarlyPauseMs)
 			return nil
 		}
 	}
@@ -2067,16 +2067,16 @@ func handleSnapshotRequest(
 	}
 
 	resp = ctl.Response{
-		CleanupWarning:   out.CleanupWarning,
-		ForkPauseMs:      forkPauseMs,
-		MemorySize:       out.MemorySize,
-		MemoryResident:   out.MemoryResident,
-		WallclockPauseMs: out.WallclockPauseMs,
-		WallclockDumpMs:  out.WallclockDumpMs,
-		DropCachesResult: dropCachesResult,
-		SnapshotRef:      out.SnapshotRef,
-		SandboxRef:       out.SandboxRef,
-		SandboxPath:      out.SandboxPath,
+		CleanupWarning:     out.CleanupWarning,
+		ApplicationPauseMs: resumeEarlyPauseMs,
+		MemorySize:         out.MemorySize,
+		MemoryResident:     out.MemoryResident,
+		WallclockPauseMs:   out.WallclockPauseMs,
+		WallclockDumpMs:    out.WallclockDumpMs,
+		DropCachesResult:   dropCachesResult,
+		SnapshotRef:        out.SnapshotRef,
+		SandboxRef:         out.SandboxRef,
+		SandboxPath:        out.SandboxPath,
 	}
 	if !req.ResumeAfter {
 		if save != nil {

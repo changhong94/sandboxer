@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Linux guest tests for fork snapshots; no existing services are modified."""
+"""Real Linux guest tests for early-resume snapshots; no existing services are modified."""
 
 import argparse
 import concurrent.futures
@@ -20,7 +20,7 @@ nonce = secrets.token_hex(16)
 def writer():
     for line in sys.stdin:
         if line.strip() == 'MUTATE':
-            with open('/fork-busy', 'r+b') as f:
+            with open('/snapshot-busy', 'r+b') as f:
                 f.write(b'B' * (32 << 20))
                 f.flush()
                 os.fsync(f.fileno())
@@ -41,14 +41,14 @@ def require(condition, message):
 
 
 def write_marker(value):
-    return ("import os; f=open('/fork-state','w'); f.write(" + repr(value)
+    return ("import os; f=open('/snapshot-state','w'); f.write(" + repr(value)
             + "); f.flush(); os.fsync(f.fileno()); f.close()")
 
 
 class Guest:
     def __init__(self, suite, config, reference=None):
         self.suite = suite
-        self.sid = 'fork-test-' + secrets.token_hex(6)
+        self.sid = 'snap-test-' + secrets.token_hex(6)
         self.lines = []
         self.changed = threading.Condition()
         self.closed = False
@@ -134,7 +134,7 @@ class Suite:
         self.binary = args.bin.resolve()
         self.timeout = args.timeout
         self.python = args.python
-        self.run_root = args.run_root / ('fork-test-' + secrets.token_hex(6))
+        self.run_root = args.run_root / ('snap-test-' + secrets.token_hex(6))
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(('KUASAR_', 'SANDBOX_', 'E2B_'))}
         self.cold = json.loads(args.config.read_text())
@@ -192,7 +192,7 @@ class Suite:
 
     def save(self, parent, mode, concurrent_write=False):
         output = self.output / 'snapshots' / secrets.token_hex(6)
-        command = [self.binary / 'sandbox-ctl', 'fork', '--sandbox-id', parent.sid,
+        command = [self.binary / 'sandbox-ctl', 'snapshot', '--resume-early', '--sandbox-id', parent.sid,
                    '--run-root', self.run_root, '--json']
         command += ['--output', output] if mode == 'local' else ['--upload']
         started = time.monotonic_ns()
@@ -206,7 +206,7 @@ class Suite:
             if concurrent_write:
                 # Do not bypass capture admission: use the process already running
                 # in the guest, through its ordinary stdin, rather than a new exec.
-                parent.wait_line(lambda line: 'fork: original guest resumed' in line, started)
+                parent.wait_line(lambda line: 'resume-early: original guest resumed' in line, started)
                 parent.process.stdin.write('MUTATE\n')
                 parent.process.stdin.flush()
                 mutated, _ = parent.wait_line(lambda line: line == 'MUTATION_DONE', started)
@@ -221,7 +221,7 @@ class Suite:
         reference = result['snapshot_ref']
         if mode == 'local':
             reference = 'file://' + str(output / reference.removeprefix('file://'))
-        return reference, {'pause_ms': result['fork_pause_ms'],
+        return reference, {'pause_ms': result['application_pause_ms'],
                            'save_complete_ms': (finished - started) / 1e6}
 
     def record(self, row):
@@ -238,7 +238,7 @@ class Suite:
             marker = secrets.token_hex(16)
             parent.py(write_marker(marker))
             if concurrent_write:
-                parent.py("import os; f=open('/fork-busy','wb'); f.write(b'A'*(32<<20)); "
+                parent.py("import os; f=open('/snapshot-busy','wb'); f.write(b'A'*(32<<20)); "
                           "f.flush(); os.fsync(f.fileno()); f.close()")
             with parent.changed:
                 previous = [line for _, line in parent.lines if line.startswith('TICK ')][-1].split()
@@ -248,20 +248,20 @@ class Suite:
             inherited = child.first_tick[1].split()
             require(inherited[1] == previous[1] and int(inherited[2]) >= int(previous[2]),
                     'memory identity/counter was not inherited')
-            require(child.py("print(open('/fork-state').read())") == marker, 'snapshot file changed')
+            require(child.py("print(open('/snapshot-state').read())") == marker, 'snapshot file changed')
             if concurrent_write:
-                require(child.py("print(open('/fork-busy','rb').read()==b'A'*(32<<20))") == 'True',
+                require(child.py("print(open('/snapshot-busy','rb').read()==b'A'*(32<<20))") == 'True',
                         'concurrent parent write polluted snapshot')
-                require(parent.py("print(open('/fork-busy','rb').read()==b'B'*(32<<20))") == 'True',
+                require(parent.py("print(open('/snapshot-busy','rb').read()==b'B'*(32<<20))") == 'True',
                         'parent lost concurrent write')
             child.py(write_marker('CHILD-AFTER'))
-            require(parent.py("print(open('/fork-state').read())") == 'PARENT-AFTER', 'child changed parent')
+            require(parent.py("print(open('/snapshot-state').read())") == 'PARENT-AFTER', 'child changed parent')
             if order == 'parent-first':
                 parent.close()
-                require(child.py("print(open('/fork-state').read())") == 'CHILD-AFTER', 'child lost state')
+                require(child.py("print(open('/snapshot-state').read())") == 'CHILD-AFTER', 'child lost state')
             else:
                 child.close()
-                require(parent.py("print(open('/fork-state').read())") == 'PARENT-AFTER', 'parent lost state')
+                require(parent.py("print(open('/snapshot-state').read())") == 'PARENT-AFTER', 'parent lost state')
             self.record({'scenario': 'resnapshot' if source else ('concurrent-write' if concurrent_write else 'isolation'),
                          'mode': mode, 'deletion_order': order, 'passed': True,
                          'concurrent_write_during_save': concurrent_write,
@@ -301,7 +301,7 @@ def main():
     parser.add_argument('--config', type=Path, required=True, help='cold-boot JSON config with Python image and writable disk')
     parser.add_argument('--manifest-config', type=Path, help='existing test Store configuration; omitted: start private fs Store')
     parser.add_argument('--output', type=Path, required=True, help='new directory; logs, artifacts and results are retained')
-    parser.add_argument('--run-root', type=Path, default=Path('/run/kuasar-fork-tests'))
+    parser.add_argument('--run-root', type=Path, default=Path('/run/kuasar-snapshot-tests'))
     parser.add_argument('--python', default='/usr/local/bin/python3', help='interpreter path inside image')
     parser.add_argument('--modes', nargs='+', choices=['local', 'remote'], default=['local', 'remote'])
     parser.add_argument('--scenario', choices=['all', 'isolation', 'concurrent', 'chain'], default='all')

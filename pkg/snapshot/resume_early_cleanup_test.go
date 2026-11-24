@@ -17,34 +17,34 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 )
 
-func TestForkUncertainCheckpointCreationAttemptsCleanup(t *testing.T) {
+func TestResumeEarlyUncertainCheckpointCreationAttemptsCleanup(t *testing.T) {
 	made, deleted := false, false
 	injected := errors.New("post-commit I/O failure")
 	s := Sources{Diffs: []DiskDiff{{TemporaryCheckpoint: func(context.Context, string) error { made = true; return injected }, OpenCheckpoint: func(context.Context, string) (ExportView, error) { t.Fatal("unexpected open"); return nil, nil }, DeleteCheckpoint: func(context.Context, string) error { deleted = true; return nil }}}}
-	_, err := freezeForkInputs(context.Background(), &s)
+	_, err := freezeResumeEarlyInputs(context.Background(), &s)
 	if !errors.Is(err, injected) || !made || !deleted {
 		t.Fatalf("unexpected: made=%v deleted=%v err=%v", made, deleted, err)
 	}
 }
-func TestForkCommittedSnapshotPreservesReferencesOnCleanupFailure(t *testing.T) {
-	testForkSinkOutcome(t, nil)
+func TestResumeEarlyCommittedSnapshotPreservesReferencesOnCleanupFailure(t *testing.T) {
+	testResumeEarlySinkOutcome(t, nil)
 }
 
-var errForkReaderOpen = errors.New("injected reader open failure")
+var errResumeEarlyReaderOpen = errors.New("injected reader open failure")
 
-func TestForkPersistenceFailureDoesNotReportSuccess(t *testing.T) {
-	for _, err := range []error{errors.New("injected storage failure"), context.Canceled, errForkReaderOpen} {
-		t.Run(err.Error(), func(t *testing.T) { testForkSinkOutcome(t, err) })
+func TestResumeEarlyPersistenceFailureDoesNotReportSuccess(t *testing.T) {
+	for _, err := range []error{errors.New("injected storage failure"), context.Canceled, errResumeEarlyReaderOpen} {
+		t.Run(err.Error(), func(t *testing.T) { testResumeEarlySinkOutcome(t, err) })
 	}
 }
 
-type forkFailSink struct {
+type resumeEarlyFailSink struct {
 	*FileSink
 	failure error
 	cancel  context.CancelFunc
 }
 
-func (s *forkFailSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (string, string, error) {
+func (s *resumeEarlyFailSink) AbsorbSnapshot(ctx context.Context, source sparse.Source) (string, string, error) {
 	if errors.Is(s.failure, context.Canceled) {
 		s.cancel()
 		return "", "", ctx.Err()
@@ -52,8 +52,8 @@ func (s *forkFailSink) AbsorbSnapshot(ctx context.Context, source sparse.Source)
 	return "", "", s.failure
 }
 
-func testForkSinkOutcome(t *testing.T, persistenceErr error) {
-	dir, err := os.MkdirTemp("/tmp", "fork-review-")
+func testResumeEarlySinkOutcome(t *testing.T, persistenceErr error) {
+	dir, err := os.MkdirTemp("/tmp", "resume-early-review-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,11 +94,11 @@ func testForkSinkOutcome(t *testing.T, persistenceErr error) {
 	defer cancel()
 	var sink ArtifactSink = NewFileSink(output, "review", nil, false, nil)
 	if persistenceErr != nil {
-		sink = &forkFailSink{sink.(*FileSink), persistenceErr, cancel}
+		sink = &resumeEarlyFailSink{sink.(*FileSink), persistenceErr, cancel}
 	}
 	deleted, resumed := false, false
 	sources := Sources{
-		Fork: true, ResumeGuest: func() error { resumed = true; return nil },
+		ResumeEarly: true, ResumeGuest: func() error { resumed = true; return nil },
 		Context: ctx, SandboxID: "review", APISock: sock, StagingDir: stage,
 		MemfdFD: ram.FD(), MemfdSize: 4096, CHApiDeadline: time.Second,
 		Quiescer: q, PortableConfig: portable,
@@ -108,10 +108,10 @@ func testForkSinkOutcome(t *testing.T, persistenceErr error) {
 				if !resumed {
 					t.Fatal("reader opened before resume")
 				}
-				if persistenceErr == errForkReaderOpen {
+				if persistenceErr == errResumeEarlyReaderOpen {
 					return nil, persistenceErr
 				}
-				return borrowedForkSource{disk}, nil
+				return borrowedResumeEarlySource{disk}, nil
 			},
 			DeleteCheckpoint: func(context.Context, string) error { deleted = true; return deletionErr },
 			SnapshotView:     func() (io.ReadSeeker, []sparse.Extent, error) { return bytes.NewReader(make([]byte, 4096)), nil, nil },

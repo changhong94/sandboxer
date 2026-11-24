@@ -6,7 +6,7 @@ parser.add_argument('--bin',required=True,type=pathlib.Path)
 parser.add_argument('--config',required=True,type=pathlib.Path)
 parser.add_argument('--manifest-config',required=True,type=pathlib.Path)
 parser.add_argument('--output',required=True,type=pathlib.Path)
-parser.add_argument('--run-root',default='/run/kuasar-fork-bench')
+parser.add_argument('--run-root',default='/run/kuasar-resume-early-bench')
 parser.add_argument('--iterations',type=int,default=50)
 args=parser.parse_args()
 prefix="fo-"+secrets.token_hex(3)
@@ -54,31 +54,31 @@ for mode in ['local','remote']:
  try:
   initial_fd=len(list((pathlib.Path('/proc')/str(parent.p.pid)/'fd').iterdir()))
   for i in range(args.iterations+1):
-   before_value=f'{mode}-{i}-before';parent.py("import os; f=open('/fork-state','w'); f.write("+repr(before_value)+"); f.flush(); os.fsync(f.fileno()); f.close()")
+   before_value=f'{mode}-{i}-before';parent.py("import os; f=open('/snapshot-state','w'); f.write("+repr(before_value)+"); f.flush(); os.fsync(f.fileno()); f.close()")
    last=parent.ticks[-1];start=time.monotonic_ns();outdir=W/'snapshots'/mode/str(i)
-   command=[B/'sandbox-ctl','fork','--sandbox-id',parent.sid,'--run-root',run,'--json']
+   command=[B/'sandbox-ctl','snapshot', '--resume-early','--sandbox-id',parent.sid,'--run-root',run,'--json']
    command+=['--output',outdir]if mode=='local'else['--upload']
    result=json.loads(call(*command,timeout=120));end=time.monotonic_ns()
    assert result['type']=='snapshot_done'
    assert any(start<t<end for t,_,_ in parent.ticks),'parent made no progress during save'
-   parent.py("import os; f=open('/fork-state','w'); f.write('PARENT-AFTER'); f.flush(); os.fsync(f.fileno()); f.close()")
+   parent.py("import os; f=open('/snapshot-state','w'); f.write('PARENT-AFTER'); f.flush(); os.fsync(f.fileno()); f.close()")
    ref=result['snapshot_ref']
    if mode=='local':ref='file://'+str(outdir/ref.removeprefix('file://'))
    child=VM(f'{prefix}-{mode}-c{i}',host,ref)
    assert child.ticks[0][1]==last[1]and child.ticks[0][2]>=last[2],('memory continuation',last,child.ticks[:3])
-   assert child.py("print(open('/fork-state').read())")==before_value
-   child.py("import os; f=open('/fork-state','w'); f.write('CHILD-AFTER'); f.flush(); os.fsync(f.fileno()); f.close()")
-   assert parent.py("print(open('/fork-state').read())")=='PARENT-AFTER'
-   assert child.py("print(open('/fork-state').read())")=='CHILD-AFTER'
+   assert child.py("print(open('/snapshot-state').read())")==before_value
+   child.py("import os; f=open('/snapshot-state','w'); f.write('CHILD-AFTER'); f.flush(); os.fsync(f.fileno()); f.close()")
+   assert parent.py("print(open('/snapshot-state').read())")=='PARENT-AFTER'
+   assert child.py("print(open('/snapshot-state').read())")=='CHILD-AFTER'
    if i==args.iterations:
     parent.close();parent=None
-    assert child.py("print(open('/fork-state').read())")=='CHILD-AFTER'
+    assert child.py("print(open('/snapshot-state').read())")=='CHILD-AFTER'
    child.close();child=None
    if parent:
-    assert parent.py("print(open('/fork-state').read())")=='PARENT-AFTER'
+    assert parent.py("print(open('/snapshot-state').read())")=='PARENT-AFTER'
     fd=len(list((pathlib.Path('/proc')/str(parent.p.pid)/'fd').iterdir()))
    else:fd=None
-   row={'mode':mode,'iteration':i,'warmup':i==0,'pause_ms':result['fork_pause_ms'],'save_ms':result['fork_save_ms'],'client_ms':(end-start)/1e6,'parent_progress_during_save':True,'restored_memory_and_file':True,'independent_writes':True,'independent_destroy':True,'parent_fd_start':initial_fd,'parent_fd_after':fd,'snapshot_ref':ref,'sandbox_ref':result['sandbox_ref']}
+   row={'mode':mode,'iteration':i,'warmup':i==0,'pause_ms':result['application_pause_ms'],'save_ms':result['save_complete_ms'],'client_ms':(end-start)/1e6,'parent_progress_during_save':True,'restored_memory_and_file':True,'independent_writes':True,'independent_destroy':True,'parent_fd_start':initial_fd,'parent_fd_after':fd,'snapshot_ref':ref,'sandbox_ref':result['sandbox_ref']}
    results.append(row);(W/'results.json').write_text(json.dumps(results,indent=2));print(json.dumps(row),flush=True)
  finally:
   if child:child.close()

@@ -20,16 +20,9 @@ import (
 // false (post-snapshot the sandbox is destroyed via /vm.shutdown).
 //
 // See docs/runtime.md#snapshot.
-func snapshotCmd(args []string) int { return snapshotOrForkCmd(args, false) }
-
-func forkCmd(args []string) int { return snapshotOrForkCmd(args, true) }
-
-func snapshotOrForkCmd(args []string, fork bool) int {
-	name := "snapshot"
-	if fork {
-		name = "fork"
-	}
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+func snapshotCmd(args []string) int {
+	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	resumeEarly := fs.Bool("resume-early", false, "resume after freezing independent inputs, before persistence completes (implies --resume)")
 	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
 	jsonOutput := fs.Bool("json", false, "emit the completed Snapshot S and Sandbox E references as JSON")
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (path fallback when --path-id is omitted)")
@@ -47,9 +40,9 @@ func snapshotOrForkCmd(args []string, fork bool) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if fork {
+	if *resumeEarly {
 		if *checkpoint != "" {
-			fmt.Fprintln(os.Stderr, "fork: named local checkpoints are not used by portable forks")
+			fmt.Fprintln(os.Stderr, "snapshot: named local checkpoints are not used by early-resume snapshots")
 			return 2
 		}
 		*resume = true
@@ -142,8 +135,8 @@ func snapshotOrForkCmd(args []string, fork bool) int {
 		DropCaches:                  dropCaches,
 		MergeRef:                    mergeRef,
 	}
-	if fork {
-		req.Type = ctl.TypeForkRequest
+	if *resumeEarly {
+		req.ResumeEarly = true
 	}
 	req.HostRetirement, err = ctl.ParseHostRetirement(os.Getenv(ctl.HostRetirementEnvironment))
 	if err != nil {
@@ -179,19 +172,19 @@ func snapshotOrForkCmd(args []string, fork bool) int {
 	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {
 		fmt.Fprintf(os.Stderr, "snapshot: warning: %s\n", warning)
 	}
-	if fork {
+	if *resumeEarly {
 		if _, err := captureReport(resp, artifact.RoleSnapshot); err != nil {
-			fmt.Fprintf(os.Stderr, "fork: invalid runtime result: %v\n", err)
+			fmt.Fprintf(os.Stderr, "snapshot: invalid runtime result: %v\n", err)
 			return 1
 		}
 		if resp.CleanupWarning != "" {
-			fmt.Fprintf(os.Stderr, "fork: snapshot saved; cleanup warning: %s\n", resp.CleanupWarning)
+			fmt.Fprintf(os.Stderr, "snapshot: snapshot saved; cleanup warning: %s\n", resp.CleanupWarning)
 		}
 	}
 	if *jsonOutput {
-		if fork {
+		if *resumeEarly {
 			// These legacy fields measure the pause RPC and sink work, not the
-			// application pause. Fork exposes its explicitly defined timings.
+			// application pause. Early resume exposes its explicitly defined timings.
 			resp.WallclockPauseMs, resp.WallclockDumpMs = 0, 0
 			if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -201,8 +194,8 @@ func snapshotOrForkCmd(args []string, fork bool) int {
 		}
 		return printCaptureJSON(resp, artifact.RoleSnapshot)
 	}
-	if fork {
-		fmt.Fprintf(os.Stderr, "fork saved: application_pause_ms=%.3f save_complete_ms=%.3f\n", resp.ForkPauseMs, resp.ForkSaveMs)
+	if *resumeEarly {
+		fmt.Fprintf(os.Stderr, "snapshot saved: application_pause_ms=%.3f save_complete_ms=%.3f\n", resp.ApplicationPauseMs, resp.SaveCompleteMs)
 		if *upload {
 			fmt.Println(resp.SnapshotManifestKey)
 		} else {

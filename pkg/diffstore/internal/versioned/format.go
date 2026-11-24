@@ -69,7 +69,7 @@ type checkpoint struct {
 	Garbage    uint64
 	Visible    bool
 	Retained   bool
-	Temporary  bool `json:",omitempty"` // owned only by a live fork capture; recover after owner exit
+	Temporary  bool `json:",omitempty"` // owned only by a live early-resume capture; recover after owner exit
 	Pending    bool
 	Bitmap     uint64 // head of the exclusive presence-copy chain
 	BitmapDone uint64 // durable GC cursor; live checkpoints always have zero

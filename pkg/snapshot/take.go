@@ -36,8 +36,8 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
-	// Fork fixes independent inputs and resumes before using the ordinary sink.
-	Fork        bool
+	// ResumeEarly fixes independent inputs and resumes before using the ordinary sink.
+	ResumeEarly bool
 	ResumeGuest func() error
 
 	FrozenMemory *FrozenMemoryCapture
@@ -168,8 +168,8 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retE
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	if s.Fork && (!resumeAfter || s.CheckpointID != "" || s.FrozenMemory != nil || s.ResumeGuest == nil) {
-		return nil, errors.New("fork requires resume, guest thaw, and ordinary portable capture")
+	if s.ResumeEarly && (!resumeAfter || s.CheckpointID != "" || s.FrozenMemory != nil || s.ResumeGuest == nil) {
+		return nil, errors.New("resume-early requires resume, guest thaw, and ordinary portable capture")
 	}
 	if s.SandboxID == "" {
 		return nil, fmt.Errorf("snapshot: empty SandboxID")
@@ -265,13 +265,13 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retE
 		return nil, err
 	}
 
-	// A fork first owns independent immutable inputs. The sink work below
+	// A resumeEarly first owns independent immutable inputs. The sink work below
 	// can then proceed after the original guest continues running.
-	if s.Fork {
+	if s.ResumeEarly {
 		if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
 			return nil, err
 		}
-		release, err := freezeForkInputs(ctx, &s)
+		release, err := freezeResumeEarlyInputs(ctx, &s)
 		if err != nil {
 			return nil, err
 		}
@@ -282,7 +282,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retE
 			}
 			if retErr == nil && result != nil {
 				result.CleanupWarning = cleanupErr.Error()
-				logf("fork: snapshot committed; temporary cleanup failed: %v", cleanupErr)
+				logf("resume-early: snapshot committed; temporary cleanup failed: %v", cleanupErr)
 			} else {
 				retErr = errors.Join(retErr, cleanupErr)
 			}
@@ -290,7 +290,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retE
 		s.Quiescer.Resume()
 		backendsResumed = true
 		if err := ch.Resume(); err != nil {
-			return nil, fmt.Errorf("fork CH resume: %w", err)
+			return nil, fmt.Errorf("resume-early CH resume: %w", err)
 		}
 		resumed = true
 		if err := s.ResumeGuest(); err != nil {
@@ -298,7 +298,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retE
 		}
 	}
 
-	// T3: emit Sandbox E from live frozen disks or the detached fork inputs.
+	// T3: emit Sandbox E from live frozen disks or the detached resumeEarly inputs.
 	// E is a dependency, not yet the operation root.
 	dumpStart := time.Now()
 	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
@@ -316,7 +316,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (result *Outputs, retE
 	// T4: CH /vm.snapshot → staging dir. CH writes only config.json + state.json
 	// there (small); the multi-GiB memory + disk never touch the staging tmpfs —
 	// they stream straight to the sink.
-	if !s.Fork {
+	if !s.ResumeEarly {
 		if err := ch.Snapshot("file://" + s.StagingDir); err != nil {
 			return nil, fmt.Errorf("CH snapshot: %w", err)
 		}

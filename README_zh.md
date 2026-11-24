@@ -184,6 +184,6 @@ make build
 
 项目原创内容采用 [Apache License 2.0](LICENSE)。Cloud Hypervisor 和其他第三方边界记录在 [`LICENSE_SCOPE_zh.md`](LICENSE_SCOPE_zh.md)。保留上游 copyright、attribution、NOTICE 和 SPDX declaration。
 
-## fork_only 第一版
+## 运行中快照提前恢复
 
-[运行中快照 fork 的接口、计时和限制](docs/fork_zh.md)。
+[snapshot --resume-early 的接口、计时和限制](docs/resume_early_zh.md)。
