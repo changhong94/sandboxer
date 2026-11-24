@@ -94,7 +94,9 @@ type Response struct {
 	CleanupWarning string `json:"cleanup_warning,omitempty"`
 	// Early-resume timing includes guest quiesce through successful application thaw.
 	ApplicationPauseMs float64 `json:"application_pause_ms,omitempty"`
-	SaveCompleteMs     float64 `json:"save_complete_ms,omitempty"`
+	// SaveCompleteMs measures server-side capture handling through persistence,
+	// commit and cleanup completion, including the application pause but excluding client round-trip overhead.
+	SaveCompleteMs float64 `json:"save_complete_ms,omitempty"`
 	// snapshot_done fields.
 	MemorySize          uint64                 `json:"memory_size,omitempty"`
 	MemoryResident      uint64                 `json:"memory_resident,omitempty"`
