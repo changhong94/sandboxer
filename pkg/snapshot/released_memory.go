@@ -115,6 +115,13 @@ func explicitMemoryBytes(source sparse.Source) (uint64, error) {
 	return explicit, nil
 }
 
+// Bound the amount of known-zero data included in mixed chunks. Small gaps
+// otherwise split the CDC input into tiny independently fetched chunks. Large
+// gaps remain sparse, and the budget prevents highly fragmented captures from
+// making an unbounded amount of zero RAM resident during restoration.
+const privateCaptureZeroBridgeLimit = 64 << 10
+const privateCaptureZeroBridgeBudget = 4 << 20
+
 // privateCaptureSource describes a complete, frozen private-RAM capture. With
 // no memory ancestry the final reader already resolves absent pages to zero.
 // Preserve explicit Zero whenever any parent/merge input exists: Hole there
@@ -122,7 +129,16 @@ func explicitMemoryBytes(source sparse.Source) (uint64, error) {
 func privateCaptureSource(fd int, size uint64, zeros []sparse.Extent, s *Sources) sparse.Source {
 	out := &releasedMemorySource{fd: fd, size: size, zeros: zeros}
 	if len(s.MemoryFromRefs) == 0 && s.MergeBaseSnapshot == "" && s.MemoryFallbackBase == nil && s.MemoryProofCandidates == nil {
-		out.holes, out.zeros = zeros, nil
+		out.zeros = nil
+		budget := uint64(privateCaptureZeroBridgeBudget)
+		for _, extent := range zeros {
+			if extent.Size <= privateCaptureZeroBridgeLimit && extent.Size <= budget {
+				out.zeros = append(out.zeros, extent)
+				budget -= extent.Size
+			} else {
+				out.holes = append(out.holes, extent)
+			}
+		}
 	}
 	return out
 }
