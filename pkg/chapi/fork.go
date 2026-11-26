@@ -144,10 +144,11 @@ func (c Client) CapturePrivate(ctx context.Context, directory string) (ForkOpera
 // both vCPUs and local budget mutation. Target and actual must both survive
 // because an inflating balloon may not yet have reached its target.
 type ForkMemoryState struct {
-	Capacity uint64
-	Target   uint64
-	Actual   uint64
-	Balloon  bool
+	RuntimePMEM string
+	Capacity    uint64
+	Target      uint64
+	Actual      uint64
+	Balloon     bool
 }
 
 func (c Client) FrozenForkMemory(ctx context.Context) (ForkMemoryState, error) {
@@ -155,6 +156,10 @@ func (c Client) FrozenForkMemory(ctx context.Context) (ForkMemoryState, error) {
 		State  string  `json:"state"`
 		Actual *uint64 `json:"memory_actual_size"`
 		Config struct {
+			PMEM []struct {
+				File     string `json:"file"`
+				ReadOnly bool   `json:"readonly"`
+			} `json:"pmem"`
 			Memory struct {
 				Size   uint64 `json:"size"`
 				Shared bool   `json:"shared"`
@@ -170,6 +175,12 @@ func (c Client) FrozenForkMemory(ctx context.Context) (ForkMemoryState, error) {
 	result := ForkMemoryState{Capacity: info.Config.Memory.Size, Balloon: info.Config.Balloon != nil}
 	if info.State != "Paused" || result.Capacity == 0 || info.Config.Memory.Shared || info.Actual == nil || *info.Actual > result.Capacity {
 		return result, errors.New("fork memory requires paused private RAM and valid actual size")
+	}
+	if len(info.Config.PMEM) != 0 {
+		if len(info.Config.PMEM) != 1 || !info.Config.PMEM[0].ReadOnly || info.Config.PMEM[0].File == "" {
+			return result, errors.New("fork requires one immutable runtime PMEM")
+		}
+		result.RuntimePMEM = info.Config.PMEM[0].File
 	}
 	result.Actual = result.Capacity - *info.Actual
 	if info.Config.Balloon != nil {

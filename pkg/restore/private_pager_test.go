@@ -168,3 +168,80 @@ func TestPrivatePagerWindowNeighborErrorPreservesRequiredPage(t *testing.T) {
 		t.Fatal("required page failure ignored")
 	}
 }
+
+func TestPrivatePagerChunkWindowFraming(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		done <- servePrivatePages(context.Background(), server, uffd.ZeroSource{}, 8192)
+	}()
+	// Size, zero extent count, and one zero extent.
+	if _, err := io.CopyN(io.Discard, client, 32); err != nil {
+		t.Fatal(err)
+	}
+	var req [16]byte
+	binary.LittleEndian.PutUint64(req[:8], 4096)
+	binary.LittleEndian.PutUint64(req[8:], 4096|uint64(3)<<62)
+	if _, err := client.Write(req[:]); err != nil {
+		t.Fatal(err)
+	}
+	var reply [16]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint64(reply[:8]) != 4096 || binary.LittleEndian.Uint64(reply[8:]) != 4096 {
+		t.Fatalf("bad framed window: %x", reply)
+	}
+	data := make([]byte, 4096)
+	if _, err := io.ReadFull(client, data); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, make([]byte, 4096)) {
+		t.Fatal("nonzero source data")
+	}
+	client.Close()
+	<-done
+}
+
+type resolvedOnlySource struct{ uffd.ZeroSource }
+
+func (resolvedOnlySource) RunAt(uint64, uint64) (sparse.Run, error) {
+	panic("resolved window must not be resolved again")
+}
+
+type countedPrivateRun struct {
+	calls int
+	inner uint64
+}
+
+func (*countedPrivateRun) Offset() uint64       { return 1024 }
+func (*countedPrivateRun) End() uint64          { return 16384 }
+func (*countedPrivateRun) Kind() sparse.RunKind { return sparse.Data }
+func (r *countedPrivateRun) ReadAt(_ context.Context, b []byte, inner uint64) (int, error) {
+	r.calls++
+	r.inner = inner
+	for i := range b {
+		b[i] = 0x37
+	}
+	return len(b), nil
+}
+func TestPrivatePagerUsesResolvedWindowOnce(t *testing.T) {
+	r := &countedPrivateRun{}
+	b := make([]byte, 8192)
+	if err := readResolvedPrivateRange(context.Background(), resolvedOnlySource{}, r, b, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if r.calls != 1 || r.inner != 3072 || !bytes.Equal(b, bytes.Repeat([]byte{0x37}, 8192)) {
+		t.Fatalf("incorrect resolved read: %+v", r)
+	}
+	for _, off := range []uint64{0, 12288, 16385} {
+		if err := readResolvedPrivateRange(context.Background(), resolvedOnlySource{}, r, b, off); err == nil {
+			t.Fatal("read escaped root-visible window")
+		}
+	}
+	if r.calls != 1 {
+		t.Fatal("out-of-window read reached source")
+	}
+}

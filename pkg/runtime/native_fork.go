@@ -155,7 +155,19 @@ func ForkNative(ctx context.Context, parent NativeForkSource, spec NativeForkSpe
 				for _, disk := range env.Disks {
 					paths = append(paths, disk.Sock)
 				}
-				paths = append(paths, runtimePath)
+				if frozenMemory.RuntimePMEM == "" {
+					paths = append(paths, runtimePath)
+				} else {
+					// The child retains this immutable mapping. Require the same resolved
+					// artifact path rather than silently reusing a different runtime image.
+					resolved, err := filepath.EvalSymlinks(runtimePath)
+					if err != nil {
+						return nil, err
+					}
+					if resolved != frozenMemory.RuntimePMEM {
+						return nil, errors.New("fork runtime PMEM artifact path mismatch")
+					}
+				}
 				request := chapi.NativeForkRequest{ChildCgroup: cgroup, ChildLogFile: filepath.Join(env.RunDir, "vmm.log"), ChildAPISocket: env.CHSock, ChildSerialSocket: filepath.Join(env.RunDir, "private.serial"), ChildPidfdSocket: listener.Addr().String(), NativeChildDisks: paths, ChildVsock: &chapi.ForkVsock{CID: spec.ChildCID, Socket: env.VsockBase}}
 				if network != nil {
 					request.ChildNetwork = &chapi.ForkNetwork{TAP: network.TAP, MAC: network.MAC, NumQueues: 2}

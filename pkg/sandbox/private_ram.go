@@ -2,14 +2,15 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
 
 // privateRAMCommand keeps every guest-memory writer inside CH. The native disk
 // owners remain external, but exchange disk payloads rather than RAM mappings.
-// The immutable runtime is a read-only virtio disk: a writable PMEM alias would
-// otherwise need separate fork ownership and dirty-page preservation.
+// The runtime is normally a read-only virtio disk. Experimental PMEM must be
+// enforced read-only; discard_writes alone still permits unsaved guest writes.
 func privateRAMCommand(args []string, capBytes uint64, runtimePath, runDir string, disks []DiskArg) ([]string, error) {
 	if capBytes == 0 || len(disks) > 24 {
 		return nil, fmt.Errorf("private RAM: invalid device geometry")
@@ -19,7 +20,12 @@ func privateRAMCommand(args []string, capBytes uint64, runtimePath, runDir strin
 	if err != nil {
 		return nil, err
 	}
+	// Opt-in until native fork and persisted restore are validated together.
+	readonlyPMEM := os.Getenv("KUASAR_PRIVATE_RUNTIME_PMEM") == "1"
 	runtimeDevice := fmt.Sprintf("/dev/vd%c", 'a'+len(disks))
+	if readonlyPMEM {
+		runtimeDevice = "/dev/pmem0"
+	}
 	result := []string{"--enable-fork"}
 	for i := 0; i < len(args); i++ {
 		name := args[i]
@@ -44,7 +50,7 @@ func privateRAMCommand(args []string, capBytes uint64, runtimePath, runDir strin
 				if strings.HasPrefix(w, "root=") {
 					w = "root=" + runtimeDevice
 				}
-				if strings.HasPrefix(w, "rootflags=") {
+				if strings.HasPrefix(w, "rootflags=") && !readonlyPMEM {
 					continue
 				}
 				if strings.HasPrefix(w, "console=") {
@@ -57,7 +63,10 @@ func privateRAMCommand(args []string, capBytes uint64, runtimePath, runDir strin
 			result = append(result, name)
 		}
 	}
-	result = append(result, "--memory", fmt.Sprintf("size=%d,shared=off,thp=off", capBytes), "--console", "off", "--serial", "socket="+filepath.Join(runDir, "private.serial"), "--disk")
+	result = append(result, "--memory", fmt.Sprintf("size=%d,shared=off,thp=off", capBytes), "--console", "off", "--serial", "socket="+filepath.Join(runDir, "private.serial"))
+	if len(disks) > 0 || !readonlyPMEM {
+		result = append(result, "--disk")
+	}
 	for _, d := range disks {
 		v := "path=" + d.Sock + ",image_type=raw,sparse=off"
 		if d.ReadOnly {
@@ -65,6 +74,12 @@ func privateRAMCommand(args []string, capBytes uint64, runtimePath, runDir strin
 		}
 		result = append(result, v)
 	}
-	result = append(result, "path="+runtimePath+",image_type=raw,readonly=on,sparse=off")
+	if readonlyPMEM {
+		// The runtime remains outside private RAM only with an enforced read-only
+		// host mapping and KVM slot, not merely discard_writes or a read-only guest FS.
+		result = append(result, "--pmem", "file="+runtimePath+",readonly=on,discard_writes=on,iommu=off")
+	} else {
+		result = append(result, "path="+runtimePath+",image_type=raw,readonly=on,sparse=off")
+	}
 	return result, nil
 }

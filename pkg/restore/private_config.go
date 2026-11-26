@@ -28,8 +28,33 @@ func rewritePrivateConfig(data []byte, p pathRewrite) ([]byte, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, err
 	}
+	// Legacy snapshots keep their virtio runtime disk. New immutable PMEM
+	// snapshots retain that device topology; never reinterpret a writable mapping.
+	runtimeDisks := 1
+	pmem, pmemOK := cfg["pmem"].([]any)
+	if raw := cfg["pmem"]; raw != nil && !pmemOK {
+		return nil, fmt.Errorf("invalid private PMEM topology")
+	}
+	if len(pmem) != 0 {
+		if len(pmem) != 1 {
+			return nil, fmt.Errorf("private restore requires one immutable runtime PMEM")
+		}
+		d, ok := pmem[0].(map[string]any)
+		if !ok || d["readonly"] != true {
+			return nil, fmt.Errorf("private restore forbids writable PMEM")
+		}
+		if !filepath.IsAbs(p.RuntimePath) {
+			return nil, fmt.Errorf("private runtime path must be absolute")
+		}
+		runtime, err := filepath.EvalSymlinks(p.RuntimePath)
+		if err != nil {
+			return nil, err
+		}
+		d["file"] = runtime
+		runtimeDisks = 0
+	}
 	disks, ok := cfg["disks"].([]any)
-	if !ok || len(disks) != len(p.DiskSocks)+1 || len(p.DiskReadOnly) != len(p.DiskSocks) {
+	if !ok || len(disks) != len(p.DiskSocks)+runtimeDisks || len(p.DiskReadOnly) != len(p.DiskSocks) {
 		return nil, fmt.Errorf("private restore disk topology mismatch")
 	}
 	for i, raw := range disks {
@@ -61,9 +86,6 @@ func rewritePrivateConfig(data []byte, p pathRewrite) ([]byte, error) {
 			}
 		}
 		d["path"] = path
-	}
-	if pmem, ok := cfg["pmem"].([]any); ok && len(pmem) != 0 {
-		return nil, fmt.Errorf("private restore forbids PMEM")
 	}
 	if v, ok := cfg["vsock"].(map[string]any); ok {
 		v["socket"] = p.VsockSock

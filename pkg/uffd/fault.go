@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -58,6 +59,12 @@ type urgentOutcome struct {
 }
 
 func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+	if faultTimelineEnabled {
+		begin := time.Now()
+		defer func() {
+			log.Printf("FAULT_TIMELINE handler=%p address=%d queued_ns=%d begin_ns=%d end_ns=%d", h, ev.address, ev.queued.UnixNano(), begin.UnixNano(), time.Now().UnixNano())
+		}()
+	}
 	inflight := h.stats.inflight.Add(1)
 	recordAtomicMax(&h.stats.inflightHWM, uint64(inflight))
 	defer h.stats.inflight.Add(-1)

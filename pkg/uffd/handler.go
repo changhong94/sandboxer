@@ -54,6 +54,8 @@ type Config struct {
 
 	// Underlying memfd fd (for pread on the rare Loaded fault path).
 	MemfdFD int
+	// PrivateRAM has no shared backend mapping; only CH owns the anonymous RAM.
+	PrivateRAM bool
 
 	// Sandbox-ctl-side mmap of the memfd. Single-uffd model: backendVA
 	// is NOT registered with uffd; the handler only references it as
@@ -249,7 +251,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	if uffdCFromCH <= 0 {
 		return nil, fmt.Errorf("uffd: uffdCFromCH invalid")
 	}
-	if cfg.MemfdFD <= 0 {
+	if cfg.MemfdFD <= 0 && !cfg.PrivateRAM {
 		return nil, fmt.Errorf("uffd: MemfdFD invalid")
 	}
 	if cfg.Size <= 0 || cfg.Size%PageSize != 0 {
@@ -288,10 +290,10 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		return nil, err
 	}
 
-	if cfg.Dirty == nil {
+	if cfg.Dirty == nil && !cfg.PrivateRAM {
 		cfg.Dirty, _ = memory.NewDirty(uint64(cfg.Size))
 	}
-	if cfg.Dirty.Size() != uint64(cfg.Size) {
+	if cfg.Dirty != nil && cfg.Dirty.Size() != uint64(cfg.Size) {
 		_ = unix.Close(epfd)
 		return nil, fmt.Errorf("uffd: dirty RAM size mismatch")
 	}
@@ -695,6 +697,9 @@ func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
 // is dropped with a log line and a counter bump so the regression is
 // visible in stats. Failure to madvise increments the error counter.
 func (h *Handler) madviseBackend(memfdOffset, length uint64) {
+	if h.cfg.PrivateRAM {
+		return
+	}
 	for length > 0 {
 		backendVA, mapped, ok := h.addrMap.BackendVAFor(memfdOffset, length)
 		if !ok {

@@ -188,3 +188,31 @@ func TestChunkReservationReleasedOnEveryUrgentExit(t *testing.T) {
 		})
 	}
 }
+
+func TestPrivateRAMHandlerHasNoSharedBackend(t *testing.T) {
+	var fds [2]int
+	if err := unix.Pipe2(fds[:], unix.O_CLOEXEC|unix.O_NONBLOCK); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[1])
+	m := NewAddressMap(PageSize)
+	if err := m.RegisterVMA(ProcessCH, unitCHVA, PageSize, 0); err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewWithBackendUffd(fds[0], m, Config{PrivateRAM: true, MemfdFD: -1, Size: PageSize, Source: ZeroSource{}, NumWorkers: 2})
+	if err != nil {
+		unix.Close(fds[0])
+		t.Fatal(err)
+	}
+	// A private discard has no backend mmap to madvise. The owner alone has RAM.
+	h.madviseBackend(0, PageSize)
+	if h.stats.backendLookupMiss.Load() != 0 {
+		t.Fatal("private handler attempted shared backend lookup")
+	}
+	if err = h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = unix.FcntlInt(uintptr(fds[0]), unix.F_GETFD, 0); err == nil {
+		t.Fatal("handler leaked transferred descriptor")
+	}
+}

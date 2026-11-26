@@ -44,6 +44,12 @@ func NewStreamSnapshotSource(stream fetch.Stream, ramSize uint64) (*StreamSnapsh
 	return &StreamSnapshotSource{stream: stream, ramSize: ramSize}, nil
 }
 
+// ResolveChunkWindow exposes the same final-layer visibility used by the native
+// UFFD handler to the private-RAM pager. It never reads or decodes payloads.
+func (s *StreamSnapshotSource) ResolveChunkWindow(anchor fetch.ChunkRun, maxBytes uint64) (fetch.ChunkRun, error) {
+	return s.resolveChunkWindow(anchor, maxBytes)
+}
+
 func (s *StreamSnapshotSource) resolveChunkWindow(anchor fetch.ChunkRun, maxBytes uint64) (fetch.ChunkRun, error) {
 	window, err := fetch.ResolveChunkWindow(s.stream, anchor, maxBytes)
 	if err != nil {

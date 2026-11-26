@@ -55,3 +55,21 @@ func Mark(stage string) {
 		}
 	}
 }
+
+// CPU profiling is diagnostic-only and bounded; normal benchmarks leave this
+// unset. Each process writes its own private file and never changes GC policy.
+func init() {
+	dir := os.Getenv("KUASAR_DIAGNOSTIC_CPU_DIR")
+	if dir == "" {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("cpu-%d.pprof", os.Getpid())), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	if err = pprof.StartCPUProfile(f); err != nil {
+		f.Close()
+		return
+	}
+	go func() { time.Sleep(60 * time.Second); pprof.StopCPUProfile(); f.Close() }()
+}

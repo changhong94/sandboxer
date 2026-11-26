@@ -3,6 +3,9 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"log"
+	"os"
+	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -23,6 +26,26 @@ func RetainCurrentDiskPlan(ctx context.Context, storage *artifact.ProcessStorage
 	if cfg == nil || portable == nil || owner == nil || plan == nil || len(plan.Disks) != len(capacities) || len(plan.Disks) != len(cfg.Boot.Disks)+1 {
 		return errors.New("retained current disks require a complete checkpoint plan")
 	}
+	started := time.Now()
+	last := started
+	type phase struct {
+		Name        string
+		Nanoseconds int64
+	}
+	var phases []phase
+	trace := os.Getenv("CH_FORK_TIMING") != ""
+	mark := func(name string) {
+		if trace {
+			now := time.Now()
+			phases = append(phases, phase{name, now.Sub(last).Nanoseconds()})
+			last = now
+		}
+	}
+	defer func() {
+		if trace {
+			log.Printf("CURRENT_PLAN sid=%s total_ns=%d phases=%v", run.SandboxID, time.Since(started).Nanoseconds(), phases)
+		}
+	}()
 	bases, err := portable.Checkpointed(parent)
 	if err != nil {
 		return err
@@ -94,17 +117,20 @@ func RetainCurrentDiskPlan(ctx context.Context, storage *artifact.ProcessStorage
 		opts = provenance[0]
 	}
 	opts.Cfg, opts.PortableConfig, opts.SandboxID, opts.RefLocations = cfg, bases, run.SandboxID, locations
+	mark("validate_and_bind")
 	known := bundleKnownRefPaths(opts)
 	dependencies, err := snapshotLayerDependencies(opts, nil, make([]bool, len(disks)))
 	if err != nil {
 		return err
 	}
+	mark("collect_dependencies")
 	replacements := map[string]string{}
 	for _, dep := range dependencies {
 		retained, err := preserveNamedCheckpointDependency(ctx, dep, opts, known, owner.Directory)
 		if err != nil {
 			return err
 		}
+		mark("preserve_dependency")
 		replacements[dep.raw] = retained
 	}
 	bases, err = bases.RewriteDiskArtifactRefs(replacements)
@@ -113,5 +139,8 @@ func RetainCurrentDiskPlan(ctx context.Context, storage *artifact.ProcessStorage
 	}
 	// Every unlocated dependency now resolves in owner.Directory; remote and
 	// located dependencies retain their explicit access contract.
-	return storage.RetainCurrentDisks(ctx, owner, *run, bases, disks, locations)
+	mark("rewrite_dependencies")
+	err = storage.RetainCurrentDisks(ctx, owner, *run, bases, disks, locations)
+	mark("publish_current")
+	return err
 }

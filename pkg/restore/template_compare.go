@@ -16,10 +16,19 @@ import (
 
 type templateComparison struct {
 	sparse.Source
-	file *os.File
+	file            *os.File
+	restoreObserved bool
+	residencyDone   chan struct{}
 }
 
-func (s *templateComparison) Close() error { return s.file.Close() }
+func (s *templateComparison) Close() error {
+	if s.restoreObserved {
+		<-s.residencyDone
+		recordTemplateResidency(s)
+		finishTemplateReadahead(s.file)
+	}
+	return s.file.Close()
+}
 
 // Borrow an existing authenticated, immutable template only. Never materialize
 // a second plaintext copy or warm the packed carrier for a checkpoint. The same

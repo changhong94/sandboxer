@@ -389,7 +389,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		}()
 	}
 	markRestore("runtime_binding")
-	logf := func(format string, a ...any) { log.Printf("[sandbox-ctl run --restore sid="+opts.SandboxID+"] "+format, a...) }
+	logf := func(format string, a ...any) {
+		log.Printf("[sandbox-ctl run --restore sid="+opts.SandboxID+"] "+format, a...)
+	}
 	startUnixNs := time.Now().UnixNano()
 	runtimeMemoryRef := root.selfRef
 	selfRef := runtimeMemoryRef
@@ -515,6 +517,12 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			}
 		}
 	}()
+
+	for _, layer := range parentMemoryLayers {
+		if cached, ok := layer.(*templateComparison); ok {
+			cached.startRestoreReadahead(ctx, logf)
+		}
+	}
 
 	// Preserve both snapshot sides. SafeTarget normalization is deliberately
 	// deferred until restore ACK and MUX establishment.
@@ -701,6 +709,11 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			}
 		}
 	}
+	for _, layer := range memLayers {
+		if cached, ok := layer.(*templateComparison); ok {
+			cached.startRestoreReadahead(ctx, logf)
+		}
+	}
 	source, err := uffd.NewStreamSnapshotSource(fetch.NewLayered(memLayers...), capBytes)
 	if err != nil {
 		return -1, fmt.Errorf("snapshot source: %w", err)
@@ -812,8 +825,10 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		retain := func() error {
 			started := time.Now()
 			e := sandbox.RetainCurrentDiskPlan(retentionCtx, storage, opts.checkpointOwner, opts.CurrentRun, &retentionCfg, c0, sandboxSource.PortableRef, opts.checkpointPlan, capacities, opts.RefLocations, provenance)
+			retained := time.Since(started)
+			closeStarted := time.Now()
 			e = errors.Join(e, storage.Close())
-			logf("current disk graph persistence completed duration=%s error=%v", time.Since(started), e)
+			logf("current disk graph persistence completed duration=%s retain=%s close=%s error=%v", time.Since(started), retained, time.Since(closeStarted), e)
 			return e
 		}
 		// Cold resume has the same paused PostSpawn barrier as a prepared
