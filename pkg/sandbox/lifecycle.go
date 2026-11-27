@@ -51,7 +51,6 @@ type RunOptions struct {
 	memoryLayout             snapshot.MemoryLayout
 	memoryLogf               func(string, ...any)
 	captureMemory            func(context.Context) (*memory.CaptureView, error)
-	beginLiveMemory          func(context.Context, *memory.CaptureView) (*memory.CoWCapture, error)
 	EnableCheckpoint         bool
 	CurrentRun               *artifact.CurrentRun
 	checkpointPlan           *CheckpointDiskPlan
@@ -1030,7 +1029,6 @@ type SnapshotHandler struct {
 	PrivateRAMFork        bool
 	MemoryLayout          snapshot.MemoryLayout
 	CaptureMemory         func(context.Context) (*memory.CaptureView, error)
-	BeginLiveMemory       func(context.Context, *memory.CaptureView) (*memory.CoWCapture, error)
 	checkpointMaintenance *diffstore.DirectoryMaintenance
 	EnableCheckpoint      bool
 	CheckpointDir         string // derived from the owning VM BaseDir
@@ -1124,11 +1122,10 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
-		memoryLayout:    h.MemoryLayout,
-		PrivateRAMFork:  h.PrivateRAMFork,
-		captureMemory:   h.CaptureMemory,
-		beginLiveMemory: h.BeginLiveMemory,
-		Cfg:             h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		memoryLayout:   h.MemoryLayout,
+		PrivateRAMFork: h.PrivateRAMFork,
+		captureMemory:  h.CaptureMemory,
+		Cfg:            h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1993,18 +1990,8 @@ func handleSnapshotRequest(
 	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
 	// E/C1 drops that direct parent to match. Cold/manifest parents stack.
 	src := snapshot.Sources{
-		PrivateRAMFork:  opts.PrivateRAMFork,
-		CaptureMemory:   opts.captureMemory,
-		BeginLiveMemory: opts.beginLiveMemory,
-		ResumeGuest: func() error {
-			if err := reattachRunningGuest("live snapshot"); err != nil {
-				return err
-			}
-			if req.OnResume != nil {
-				req.OnResume()
-			}
-			return nil
-		},
+		PrivateRAMFork:        opts.PrivateRAMFork,
+		CaptureMemory:         opts.captureMemory,
 		MemoryWorkingSet:      !mergeRef,
 		MemoryDeltaBase:       memoryComparison,
 		CheckpointID:          req.CheckpointID,
@@ -2039,9 +2026,6 @@ func handleSnapshotRequest(
 	sinkOpen = false // snapshot.Take owns and closes the sink on every path.
 	out, err := snapshot.Take(src, sink, req.ResumeAfter)
 	if err != nil {
-		if errors.Is(err, snapshot.ErrLiveProtectionRecovery) {
-			return ctl.Response{}, failRecovery(err)
-		}
 		// SendQuiesce closes the old MUX and freezes the application. Take
 		// restores the VM/backend state on failure; reattach completes the
 		// guest-side recovery and thaws the application before we return.

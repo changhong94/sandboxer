@@ -90,14 +90,7 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	pageIdx := pageOffset / PageSize
 
 	if ev.flags&uffdPagefaultFlagWP != 0 {
-		capture := h.liveCapture.Load()
-		if capture == nil {
-			h.failRead(fmt.Errorf("uffd: write-protect fault without a capture"))
-			return
-		}
-		if err := capture.BeforeWrite(pageOffset, PageSize); err != nil {
-			h.failRead(fmt.Errorf("uffd: preserve CPU write: %w", err))
-		}
+		h.failRead(fmt.Errorf("uffd: unexpected write-protect fault"))
 		return
 	}
 

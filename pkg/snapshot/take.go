@@ -42,9 +42,6 @@ type Sources struct {
 	// CaptureMemory collects CH logs then freezes M/D/R after snapshot writes.
 	CaptureMemory    func(context.Context) (*memory.CaptureView, error)
 	MemoryWorkingSet bool
-	// BeginLiveMemory installs before-image protection with all writers stopped.
-	BeginLiveMemory func(context.Context, *memory.CaptureView) (*memory.CoWCapture, error)
-	ResumeGuest     func() error
 	// MemoryFallbackBase is the full owned history, before dirty trimming.
 	MemoryFallbackBase sparse.Source
 	// MemoryProofCandidates is a diagnostic bitmap-only history union, never an output selection.
@@ -260,40 +257,12 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	phase("pause_backends")
 	dumpStart := time.Now()
 	if s.PrivateRAMFork {
-		// Freeze disk generations before forking RAM. Persistence consumes only
-		// these pinned views after the original guest has resumed.
-		privateLive := resumeAfter && s.CheckpointID == "" && s.ResumeGuest != nil
-		for _, d := range s.Diffs {
-			if d.SnapshotView != nil && (d.Checkpoint == nil || d.OpenCheckpoint == nil || d.DeleteCheckpoint == nil) {
-				privateLive = false
-			}
-		}
-		if privateLive {
-			frozen, closeDisks, freezeErr := freezeLiveDisks(ctx, s.Diffs)
-			if freezeErr != nil {
-				return nil, freezeErr
-			}
-			defer func() { retErr = errors.Join(retErr, closeDisks()) }()
-			s.Diffs = frozen
-		}
 		operation, captureErr := ch.CapturePrivate(ctx, s.StagingDir)
 		if captureErr != nil {
 			return nil, fmt.Errorf("private capture: %w", captureErr)
 		}
 		if err := ch.WaitFork(ctx, operation.ID); err != nil {
 			return nil, err
-		}
-		if privateLive {
-			s.Quiescer.Resume()
-			backendsResumed = true
-			if err := ch.Resume(); err != nil {
-				return nil, err
-			}
-			resumed = true
-			if err := s.ResumeGuest(); err != nil {
-				return nil, err
-			}
-			logf("private live capture: parent resumed before persistence pause_ms=%.3f", float64(time.Since(pauseStart).Microseconds())/1000)
 		}
 		if err := waitPrivateCapture(ctx, s.StagingDir, func(ctx context.Context) error { return ch.CheckForkChild(ctx, operation.ID) }); err != nil {
 			return nil, err
@@ -313,22 +282,6 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
 	// the mapping is stable); only resident pages are read/transferred.
-	live := !s.PrivateRAMFork && resumeAfter && s.CheckpointID == "" && s.CaptureMemory != nil && s.BeginLiveMemory != nil && s.ResumeGuest != nil
-	// Legacy/non-versioned disks keep the quiesced path; do not resume over an
-	// active export. Native runners enable checkpoint-capable disks.
-	for _, d := range s.Diffs {
-		if d.SnapshotView != nil && (d.Checkpoint == nil || d.OpenCheckpoint == nil || d.DeleteCheckpoint == nil) {
-			live = false
-		}
-	}
-	if live {
-		frozen, closeDisks, err := freezeLiveDisks(ctx, s.Diffs)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { retErr = errors.Join(retErr, closeDisks()) }()
-		s.Diffs = frozen
-	}
 	var memorySource sparse.Source
 	var dirty []byte
 	var workingMemory sparse.Source
@@ -362,33 +315,6 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			return nil, fmt.Errorf("capture memory size mismatch")
 		}
 		var reader io.ReaderAt = fdReaderAt(s.MemfdFD)
-		if live {
-			if err := ch.CaptureProtect(true); err != nil {
-				return nil, fmt.Errorf("protect capture discards: %w", err)
-			}
-			capture, beginErr := s.BeginLiveMemory(ctx, view)
-			defer func() {
-				var closeErr error
-				if capture != nil {
-					logf("live capture: before_image_bytes=%d ram_bytes=%d", capture.CopiedBytes(), s.MemfdSize)
-					closeErr = capture.Close()
-				}
-				// Never enable discard until every protection is released.
-				if closeErr == nil {
-					closeErr = ch.CaptureProtect(false)
-				}
-				if closeErr != nil {
-					retErr = errors.Join(retErr, ErrLiveProtectionRecovery, closeErr)
-				}
-			}()
-			if beginErr != nil {
-				return nil, beginErr
-			}
-			if capture == nil {
-				return nil, fmt.Errorf("live capture: missing memory owner")
-			}
-			reader = capture
-		}
 		memorySource, dirty, err = CaptureMemory(reader, view, s.MemoryWorkingSet)
 		if err != nil {
 			return nil, err
@@ -408,18 +334,6 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			return nil, fmt.Errorf("memory layout: %w", err)
 		}
 		memorySource = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
-	}
-	if live {
-		s.Quiescer.Resume()
-		backendsResumed = true
-		if err := ch.Resume(); err != nil {
-			return nil, fmt.Errorf("live CH resume: %w", err)
-		}
-		resumed = true
-		if err := s.ResumeGuest(); err != nil {
-			return nil, fmt.Errorf("live guest resume: %w", err)
-		}
-		logf("live capture: parent resumed before persistence pause_ms=%.3f", float64(time.Since(pauseStart).Microseconds())/1000)
 	}
 	phase("memory_layout")
 	if s.MemoryDeltaBase != nil {

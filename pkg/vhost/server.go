@@ -1064,7 +1064,3 @@ func (s *Server) NotifyCapacity() error {
 	}
 	return err
 }
-
-// SetBeforeWrite binds snapshot protection. Caller must hold backend quiescence
-// when changing the hook after serving has begun.
-func (s *Server) SetBeforeWrite(before func(uint64, uint64) error) { s.memTable.BeforeWrite = before }

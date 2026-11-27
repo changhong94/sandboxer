@@ -236,41 +236,6 @@ The `fork phase` log separates capture plus parent reattachment from publication
 after resume. Neither field is labeled as pure guest pause. CLI/API smoke timings
 are correctness diagnostics, not a comparison with the previous fast backend.
 
-## Shared-memory live capture
-
-CH patch 0016 optionally registers shmem UFFD write-protection, while preserving
-MISSING faults for lazy restoration. The runtime freezes CPU/device state,
-registers durable named CoW disk checkpoints and pins their immutable export
-views. It copies only the memory residency/dirty metadata initially. A CPU write
-fault or vhost writable-buffer access preserves that page's original 4 KiB before
-allowing the write. Snapshot reads use these before-images or untouched live pages;
-absent pages retain the existing immutable history/zero semantics.
-
-The CH capture-protect gate inhibits balloon inflation/reporting hole punches
-until all snapshot readers and write protections are closed. Enabling the gate
-requires a paused VM. Hints can complete without physical reclamation during the
-capture; subsequent reports may reclaim memory normally. Backend aliases must
-enter BeforeBackendWrite before returning a mutable slice. Protecting only the
-CH mapping would be incorrect.
-
-After these barriers, the parent VM and guest MUX resume before disk/memory
-serialization. Successful return still means the ordinary native local or
-Manifest commit completed; no durability barrier is removed. Temporary named disk
-checkpoints are reclaimed after reader pins close. Unsupported non-versioned
-writes retain the old fully-quiesced path. Overlapping captures are rejected.
-
-`live capture: parent resumed before persistence pause_ms` starts immediately
-before CH pause and ends after guest reattachment; it excludes earlier guest
-quiesce preparation and must not be described as the full application pause.
-`before_image_bytes` reports copied overwritten pages, not persisted snapshot
-size. The shared-memfd kernel probe and the API harness's `--memory-stress` check
-complement the ordinary local/remote, SDK, connection and lifecycle tests.
-
-The CH builder validates patch contents and fingerprints source, compiler and
-build inputs before reusing an existing binary. A missing or mismatched stamp
-forces a rebuild. The distributable patch series, not an unexported edit in
-native-deps/build, is the source of truth.
-
 ## Image-independent native pool
 
 `runtime.NewPool` prepares `RuntimeReady` VMs without workload images or tenant
@@ -293,34 +258,6 @@ image-independent prepared VMs. Configure a runner pool with `prepared_vm: true`
 and retain an ordinary runner pool for memory restores and incompatible requests.
 Preparation uses native StartRuntime, without a tenant image, credentials or
 language interpreter. Acquired workloads support the migrated running fork.
-
-## Reusable running-sandbox snapshots
-
-Authenticated `POST /sandboxes/{id}/snapshots` accepts an empty body (or `{}`),
-captures the running source and publishes using the node's configured storage.
-It returns `templateID`, inherited launch-safe `metadata` and `elapsedMs` after
-publication commits. `elapsedMs` is the complete capture/publication operation,
-not application pause. No child is created by this request. Reuse the returned
-template with ordinary `POST /sandboxes`; it remains valid after source deletion.
-Artifact references are not garbage-collection authority, matching native export.
-
-A trusted connector lease may reuse a historical MAC after that port is released.
-Snapshot bytes alone cannot establish that the historical VM still owns the
-address. Provider-supplied TAPs remain gated through fork identity reset; direct
-named-TAP callers still require a different configured MAC/TAP. The provider
-must enforce exclusive live leases. TCP cleanup and entropy renewal are never
-skipped merely because a released historical address is reused.
-
-## Parent access during persistence
-
-`--json --resume --progress` opts into a framed `snapshot_resumed` control event
-and a corresponding JSON CLI event. The runtime emits it only after guest thaw
-and MUX reattachment. The orchestrator uses this acknowledgement to restore the
-parent's Proxy route while serialization/persistence continues. It retains the
-source lifecycle lock until publication finishes, so concurrent deletion cannot
-invalidate the capture inputs. Progress does not mean the snapshot is durable;
-only the final successful result certifies publication. Older callers keep the
-single-response protocol; non-live capture can omit the early notification.
 
 ## Persistent storage boundary
 

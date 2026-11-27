@@ -524,15 +524,6 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		}
 		s.SetReadFatal(reportReadFatal)
 		s.SetDirtyTracker(dirty.Mark)
-		s.SetBeforeWrite(func(off, length uint64) error {
-			uffdHandlerMu.Lock()
-			h := uffdHandler
-			uffdHandlerMu.Unlock()
-			if h == nil {
-				return fmt.Errorf("capture: UFFD handler unavailable")
-			}
-			return h.BeforeBackendWrite(off, length)
-		})
 		s.SetMemoryLoader(func(ctx context.Context, off, length uint64) error {
 			select {
 			case <-ctx.Done():
@@ -758,15 +749,6 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	dirtyCollector := chapi.NewDirtyMemoryCollector(chapi.Client{Sock: chSock, RespDeadline: p.SnapCfg.CHApiDeadline()}, uint64(memfd.Size()))
 	snapHandler := &SnapshotHandler{
 		PrivateRAMFork: p.PrivateRAMFork,
-		BeginLiveMemory: func(ctx context.Context, view *memory.CaptureView) (*memory.CoWCapture, error) {
-			uffdHandlerMu.Lock()
-			h := uffdHandler
-			uffdHandlerMu.Unlock()
-			if h == nil {
-				return nil, fmt.Errorf("capture: UFFD handler unavailable")
-			}
-			return h.BeginLiveCapture(memfdCaptureReader{memfd.FD()}, view)
-		},
 		CaptureMemory: func(ctx context.Context) (*memory.CaptureView, error) {
 			if p.PrivateRAMFork {
 				return nil, fmt.Errorf("private RAM capture adapter is not installed")

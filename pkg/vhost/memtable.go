@@ -37,9 +37,6 @@ type MemTable struct {
 	// EnsureLoaded must be bound before serving, including cold start.
 	EnsureLoaded func(context.Context, uint64, uint64) error
 	MarkDirty    func(uint64, uint64) error
-	// BeforeWrite preserves snapshot bytes before exposing any mutable alias.
-	// Bind before serving, or replace only while all backend queues are quiescent.
-	BeforeWrite func(uint64, uint64) error
 }
 
 // SetRegions replaces the memory table atomically. The previous regions'
@@ -107,11 +104,6 @@ func (m *MemTable) translate(ctx context.Context, addr, length uint64, uva, writ
 		}
 		if err := ctx.Err(); err != nil {
 			return fail(err)
-		}
-		if writable && m.BeforeWrite != nil {
-			if err := m.BeforeWrite(r.MmapOffset+off, length); err != nil {
-				return fail(fmt.Errorf("vhost: preserve memory: %w", err))
-			}
 		}
 		if writable && m.MarkDirty != nil {
 			if err := m.MarkDirty(r.MmapOffset+off, length); err != nil {

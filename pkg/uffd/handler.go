@@ -108,7 +108,6 @@ type Handler struct {
 	released     *memory.Dirty
 	captureError error // guarded by installMu; sticky registration/event failure
 	// Live capture hook is published only while every CPU/backend writer is stopped.
-	liveCapture atomic.Pointer[memory.CoWCapture]
 
 	// Lock order: admission (uffdsMu), installMu, AddressMap, PageState.
 	// installMu covers nonblocking event read + release publication and each

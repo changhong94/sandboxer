@@ -320,17 +320,6 @@ func requireJSONEOF(dec *json.Decoder) error {
 	return nil
 }
 
-// CaptureProtect inhibits physical balloon discard during before-image capture.
-// Enabling requires paused CH; disabling follows reader/protection teardown.
-func (c Client) CaptureProtect(enabled bool) error {
-	body := "false"
-	if enabled {
-		body = "true"
-	}
-	return c.do("PUT", "/api/v1/vm.capture-protect", body)
-}
-
-// ResizeDisk publishes the already committed native backend geometry to virtio.
 func (c Client) ResizeDisk(ctx context.Context, id string, size uint64) error {
 	body, err := json.Marshal(map[string]any{"id": id, "desired_size": size})
 	if err != nil {
