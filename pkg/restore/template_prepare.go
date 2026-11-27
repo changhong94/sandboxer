@@ -46,11 +46,13 @@ func (p *PreparedSources) stageTemplateMemory(ctx context.Context, root string, 
 	if err == nil && ok && os.Getenv("KUASAR_TEMPLATE_MEMORY_CACHE_DIR") != "" {
 		if want, found := p.stageFiles[filepath.Clean(p.opts.SnapshotPath)]; found {
 			released, hintErr := releasePackedSourcePages(os.Getenv("KUASAR_TEMPLATE_PACKED_SOURCE_ROOT"), p.opts.SnapshotPath, want)
-			if released != 0 || hintErr != nil {
+			if hintErr != nil || (released != 0 && os.Getenv("KUASAR_POOL_TRACE") == "1") {
 				log.Printf("packed source cache handoff advised_bytes=%d error=%v", released, hintErr)
 			}
 		}
 	}
-	log.Printf("template memory cache preparation enabled=%t elapsed=%s error=%v", ok, time.Since(started), err)
+	if err != nil || os.Getenv("KUASAR_POOL_TRACE") == "1" {
+		log.Printf("template memory cache preparation enabled=%t elapsed=%s error=%v", ok, time.Since(started), err)
+	}
 	return err
 }

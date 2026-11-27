@@ -165,6 +165,8 @@ func prepareSlotCatalogValuesWithFirst(ctx context.Context, descriptors []restor
 			return nil, err
 		}
 	}
-	log.Printf("slot catalogs ready count=%d requested=%d duration=%s", len(entries), len(descriptors), time.Since(started))
+	if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+		log.Printf("slot catalogs ready count=%d requested=%d duration=%s", len(entries), len(descriptors), time.Since(started))
+	}
 	return entries, nil
 }

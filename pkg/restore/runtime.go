@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/instanceenv"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 )
 
@@ -119,6 +120,8 @@ func ResolveRuntimeBinding(ctx context.Context, configured, required string) (st
 		return failure(errors.Join(primaryErr, fmt.Errorf("boot.runtime fallback %s: %w", fallback, fallbackErr)),
 			primaryIncompatible && fallbackIncompatible)
 	}
-	log.Printf("[sandbox runtime] selected %s after %v", fallback, primaryErr)
+	if !instanceenv.Shared(ctx) || os.Getenv("KUASAR_POOL_TRACE") == "1" {
+		log.Printf("[sandbox runtime] selected %s after %v", fallback, primaryErr)
+	}
 	return fallback, nil
 }

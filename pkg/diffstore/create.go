@@ -96,19 +96,27 @@ func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDif
 // publish completes materialization durably before releasing the creation claim.
 // A failure after rename leaves the committed data in place for inspection.
 func (f *freshDiffInit) publish() error {
+	trace := newPrepareTrace(f.finalPath, "file_sync")
+	defer trace.finish()
 	if err := f.publishHook("before-sync"); err != nil {
 		return err
 	}
 	if err := f.diff.Sync(); err != nil {
 		return err
 	}
-	return f.commit()
+	trace.mark("sync")
+	err := f.commit()
+	trace.mark("commit")
+	return err
 }
 
 func (f *freshDiffInit) commit() error {
+	trace := newPrepareTrace(f.finalPath, "commit")
+	defer trace.finish()
 	if err := commitFreshDiff(f.tmpPath, f.finalPath); err != nil {
 		return err
 	}
+	trace.mark("rename")
 	f.committed = true
 	if err := f.publishHook("renamed"); err != nil {
 		return err
@@ -116,8 +124,11 @@ func (f *freshDiffInit) commit() error {
 	if err := f.releaseClaim(); err != nil {
 		return err
 	}
+	trace.mark("claim_release")
 	if err := f.publishHook("directory-sync"); err != nil {
 		return err
 	}
-	return syncDirectory(filepath.Dir(f.finalPath))
+	err := syncDirectory(filepath.Dir(f.finalPath))
+	trace.mark("directory_sync")
+	return err
 }

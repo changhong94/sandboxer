@@ -9,17 +9,34 @@ import (
 )
 
 func TestPreparedShapeCannotReuseChangedStateOrCapacity(t *testing.T) {
+	for _, staged := range []bool{false, true} {
+		name := "assigned"
+		if staged {
+			name = "generic-slot"
+		}
+		t.Run(name, func(t *testing.T) { testPreparedShapeReceipt(t, staged) })
+	}
+}
+
+func testPreparedShapeReceipt(t *testing.T, staged bool) {
+	resolve := resolvePreparedShape
+	if staged {
+		resolve = func(c, s []byte, cpu int, cap, base uint64, opts Options) (preparedShape, error) {
+			opts.PreparedRestore = nil
+			return resolvePreparedShapeReceipt(c, s, cpu, cap, base, opts, true)
+		}
+	}
 	t.Setenv("KUASAR_PREPARED_ARTIFACT_CACHE", filepath.Join(t.TempDir(), "cache"))
 	cfg := []byte(`{"cpus":{"boot_vcpus":2,"max_vcpus":2},"memory":{"size":8192,"shared":false}}`)
 	tree := chSnapshotTree{Snapshots: map[string]*chSnapshotTree{"memory-manager": {SnapshotData: &chSnapshotData{State: `{"memory_ranges":{"data":[{"gpa":0,"length":8192}]}}`}}}}
 	state, _ := json.Marshal(tree)
 	key := [32]byte{2}
 	opts := Options{PreparedRestore: &sandbox.PreparedRestore{}, PrivateRAMFork: true, CustomerKeyFn: func() ([32]byte, error) { return key, nil }}
-	first, e := resolvePreparedShape(cfg, state, 2, 8192, 8192, opts)
+	first, e := resolve(cfg, state, 2, 8192, 8192, opts)
 	if e != nil {
 		t.Fatal(e)
 	}
-	second, e := resolvePreparedShape(cfg, state, 2, 8192, 8192, opts)
+	second, e := resolve(cfg, state, 2, 8192, 8192, opts)
 	if e != nil || first != second {
 		t.Fatalf("cache %v", e)
 	}
@@ -30,21 +47,21 @@ func TestPreparedShapeCannotReuseChangedStateOrCapacity(t *testing.T) {
 	raw, _ := os.ReadFile(files[0])
 	raw[len(raw)-2] ^= 1
 	os.WriteFile(files[0], raw, 0600)
-	second, e = resolvePreparedShape(cfg, state, 2, 8192, 8192, opts)
+	second, e = resolve(cfg, state, 2, 8192, 8192, opts)
 	if e != nil || first != second {
 		t.Fatalf("tampered receipt accepted: %v", e)
 	}
-	if _, e = resolvePreparedShape(cfg, state, 2, 4096, 8192, opts); e == nil {
+	if _, e = resolve(cfg, state, 2, 4096, 8192, opts); e == nil {
 		t.Fatal("capacity mismatch accepted")
 	}
-	if _, e = resolvePreparedShape(cfg, []byte(`{}`), 2, 8192, 8192, opts); e == nil {
+	if _, e = resolve(cfg, []byte(`{}`), 2, 8192, 8192, opts); e == nil {
 		t.Fatal("changed memory state accepted")
 	}
-	if _, e = resolvePreparedShape(cfg, state, 1, 8192, 8192, opts); e == nil {
+	if _, e = resolve(cfg, state, 1, 8192, 8192, opts); e == nil {
 		t.Fatal("CPU mismatch accepted")
 	}
 	key[0] = 3
-	_, e = resolvePreparedShape(cfg, state, 2, 8192, 8192, opts)
+	_, e = resolve(cfg, state, 2, 8192, 8192, opts)
 	if e != nil {
 		t.Fatal(e)
 	}

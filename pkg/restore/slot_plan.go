@@ -146,7 +146,9 @@ func (p *PreparedSources) stageForSlot(ctx context.Context, spec sandbox.Runtime
 	if err != nil {
 		return err
 	}
-	shape, err := validatePreparedShape(p.snapshot.ConfigJSON, p.snapshot.StateJSON, cfg.Resources.Capacity.CPU, cap, p.snapshot.ArchiveBase, true)
+	shapeOpts := p.opts
+	shapeOpts.PrivateRAMFork = true
+	shape, err := resolvePreparedShapeReceipt(p.snapshot.ConfigJSON, p.snapshot.StateJSON, cfg.Resources.Capacity.CPU, cap, p.snapshot.ArchiveBase, shapeOpts, true)
 	if err != nil {
 		return err
 	}
@@ -371,7 +373,9 @@ func (p *PreparedSources) stageForSlot(ctx context.Context, spec sandbox.Runtime
 	}
 	trace("template_memory")
 	p.slotPlan = plan
-	log.Printf("slot restore plan prepared duration=%s disks=%d", time.Since(started), len(plan.disk.Disks))
+	if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+		log.Printf("slot restore plan prepared duration=%s disks=%d", time.Since(started), len(plan.disk.Disks))
+	}
 	return nil
 }
 

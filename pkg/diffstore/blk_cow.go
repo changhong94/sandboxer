@@ -509,15 +509,19 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 	if fresh == nil {
 		return nil
 	}
+	trace := newPrepareTrace(fresh.finalPath, "materialize")
+	defer trace.finish()
 	// Never hold frontend stripes while waiting. Initialization belongs to the
 	// backend and cannot be canceled by ordinary teardown or a request timeout.
 	if err := c.diff.waitInitialized(context.Background()); err != nil {
 		return err
 	}
+	trace.mark("initialize")
 	c.cache.mu.Lock()
 	c.cache.signalLocked()
 	c.cache.kickLocked(true)
 	c.cache.mu.Unlock()
+	trace.mark("cache_gate")
 	if ctx.Err() != nil {
 		return errMaterialDiscard
 	}
@@ -528,6 +532,7 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 			}
 			return err
 		}
+		trace.mark("read_decode_install")
 		if verifier, ok := template.(TemplateVerifier); ok {
 			if err := verifier.Verify(ctx); err != nil {
 				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
@@ -536,6 +541,7 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 				return fmt.Errorf("verify diff template: %w", err)
 			}
 		}
+		trace.mark("verify")
 		// Detach only after every template page is owned by committed or
 		// cached upper state. Existing readers retain their borrowed source.
 		c.materialMu.Lock()
@@ -547,6 +553,7 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 			return fmt.Errorf("close materialized diff template: %w", err)
 		}
 	}
+	trace.mark("reader_release")
 	c.signalMaterialReady()
 	if err := c.cache.drain(ctx, c); err != nil {
 		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
@@ -554,6 +561,7 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 		}
 		return err
 	}
+	trace.mark("drain")
 	// Publication is admitted under the teardown gate. Once admitted, preserve
 	// its real sync/rename/dirsync result even if Close requests disposal.
 	c.materialMu.Lock()
@@ -562,7 +570,9 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 	if discard {
 		return errMaterialDiscard
 	}
-	return fresh.publish()
+	err := fresh.publish()
+	trace.mark("publish")
+	return err
 }
 
 func (c *Disk) materializeContents(ctx context.Context, template TemplateSource) error {

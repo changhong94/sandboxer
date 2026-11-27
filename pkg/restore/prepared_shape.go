@@ -78,11 +78,17 @@ func resolvePreparedShape(configJSON, stateJSON []byte, cpu int, declaredCap, ar
 	if p := opts.PreparedSources; p != nil && p.taken && p.slotPlan != nil && opts.PrivateRAMFork && p.slotPlan.cpu == cpu && p.slotPlan.capacity == declaredCap && p.snapshot.ArchiveBase == archiveBase {
 		return p.slotPlan.shape, nil
 	}
+	return resolvePreparedShapeReceipt(configJSON, stateJSON, cpu, declaredCap, archiveBase, opts, opts.PreparedRestore != nil)
+}
+
+// Generic slot staging and assigned restores use the same authenticated receipt.
+// It binds all immutable state and shape parameters, and retains no decoded tree.
+func resolvePreparedShapeReceipt(configJSON, stateJSON []byte, cpu int, declaredCap, archiveBase uint64, opts Options, prepared bool) (preparedShape, error) {
 	validate := func() (preparedShape, error) {
 		return validatePreparedShape(configJSON, stateJSON, cpu, declaredCap, archiveBase, opts.PrivateRAMFork)
 	}
 	dir := os.Getenv("KUASAR_PREPARED_ARTIFACT_CACHE")
-	if opts.PreparedRestore == nil || dir == "" || !filepath.IsAbs(dir) || opts.CustomerKeyFn == nil {
+	if !prepared || dir == "" || !filepath.IsAbs(dir) || opts.CustomerKeyFn == nil {
 		return validate()
 	}
 	key, err := opts.CustomerKeyFn()
