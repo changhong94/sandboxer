@@ -136,22 +136,11 @@ func servePrivatePagesWithPlan(ctx context.Context, conn net.Conn, source uffd.S
 		}
 		if n == 0 && off == 0 && local.inlineDelta() {
 			started := time.Now()
-			buf := make([]byte, 64<<10)
-			var total uint64
-			for _, e := range local.missing {
-				for cursor := uint64(0); cursor < e[1]; {
-					count := min(uint64(len(buf)), e[1]-cursor)
-					if err := readPrivatePageRange(ctx, source, buf[:count], e[0]+cursor); err != nil {
-						return err
-					}
-					if _, err := io.Copy(conn, bytes.NewReader(buf[:count])); err != nil {
-						return err
-					}
-					cursor += count
-					total += count
-				}
+			stats, err := writePrivateDelta(ctx, conn, source, local.missing)
+			log.Printf("PRIVATE_DELTA_INLINE socket=%s bytes=%d reads=%d batches=%d resolve_ns=%d read_ns=%d write_ns=%d elapsed_ns=%d ok=%t", conn.LocalAddr(), stats.bytes, stats.reads, stats.batches, stats.resolve.Nanoseconds(), stats.read.Nanoseconds(), stats.write.Nanoseconds(), time.Since(started).Nanoseconds(), err == nil)
+			if err != nil {
+				return err
 			}
-			log.Printf("PRIVATE_DELTA_INLINE bytes=%d elapsed_ns=%d", total, time.Since(started).Nanoseconds())
 			continue
 		}
 		window := n&(uint64(1)<<63) != 0
