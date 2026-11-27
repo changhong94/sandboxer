@@ -288,6 +288,17 @@ func protectProcessLocalReadError(codec tarstream.Codec, op string, err error) e
 	return &processLocalReadError{op: op, err: err}
 }
 
+// DetectRefFileFormat resolves the same trusted location and physical carrier
+// as OpenFileWithLocations. This only selects an optional optimization; it
+// does not authenticate content or replace the normal artifact opener.
+func DetectRefFileFormat(path string, ref manifest.Ref, locations config.RefLocations) (FileFormat, error) {
+	physical, err := resolveFileTarget(path, ref, locations)
+	if err != nil {
+		return 0, err
+	}
+	return DetectFileFormat(physical)
+}
+
 // DetectFileFormat performs the non-consuming magic check used by snapshot,
 // restore, info, merge, and upload paths. Non-ZIP input is delegated to the
 // tarstream parser, which distinguishes encrypted and plaintext envelopes.
